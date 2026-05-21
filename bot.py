@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -326,3 +326,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+async def main():
+    @dp.message(Command("myid"))
+async def my_id(message: Message):
+    await message.answer(f"Sizning Telegram ID: {message.from_user.id}")
