@@ -43,7 +43,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             telegram_id INTEGER PRIMARY KEY,
             full_name TEXT,
+            username TEXT,
             stars INTEGER DEFAULT 1,
+            is_blocked INTEGER DEFAULT 0,
             created_at TEXT
         )
     """)
@@ -73,7 +75,7 @@ def init_db():
     conn.close()
 
 
-def add_user(telegram_id: int, full_name: str):
+def add_user(telegram_id: int, full_name: str, username: str | None):
     conn = db()
     cur = conn.cursor()
 
@@ -82,9 +84,48 @@ def add_user(telegram_id: int, full_name: str):
 
     if not exists:
         cur.execute(
-            "INSERT INTO users (telegram_id, full_name, stars, created_at) VALUES (?, ?, ?, ?)",
-            (telegram_id, full_name, 1, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            """
+            INSERT INTO users (telegram_id, full_name, username, stars, is_blocked, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                telegram_id,
+                full_name,
+                username or "",
+                1,
+                0,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            )
         )
+    else:
+        cur.execute(
+            "UPDATE users SET full_name = ?, username = ? WHERE telegram_id = ?",
+            (full_name, username or "", telegram_id)
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def is_blocked(telegram_id: int) -> bool:
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT is_blocked FROM users WHERE telegram_id = ?", (telegram_id,))
+    row = cur.fetchone()
+
+    conn.close()
+    return bool(row and row[0] == 1)
+
+
+def set_block_status(telegram_id: int, status: int):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "UPDATE users SET is_blocked = ? WHERE telegram_id = ?",
+        (status, telegram_id)
+    )
 
     conn.commit()
     conn.close()
@@ -195,8 +236,81 @@ def get_stats():
     cur.execute("SELECT COUNT(*) FROM bookings")
     bookings_count = cur.fetchone()[0]
 
+    cur.execute("SELECT COUNT(*) FROM users WHERE is_blocked = 1")
+    blocked_count = cur.fetchone()[0]
+
     conn.close()
-    return users_count, stores_count, bookings_count
+    return users_count, stores_count, bookings_count, blocked_count
+
+
+def get_all_users(limit: int = 20):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT telegram_id, full_name, username, stars, is_blocked, created_at
+        FROM users
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (limit,)
+    )
+
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_all_stores(limit: int = 20):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT s.store_id, s.telegram_id, u.full_name, u.username, s.created_at
+        FROM stores s
+        LEFT JOIN users u ON s.telegram_id = u.telegram_id
+        ORDER BY s.id DESC
+        LIMIT ?
+        """,
+        (limit,)
+    )
+
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_all_bookings(limit: int = 20):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT b.telegram_id, u.full_name, b.store_id, b.invoice, b.date, b.status, b.created_at
+        FROM bookings b
+        LEFT JOIN users u ON b.telegram_id = u.telegram_id
+        ORDER BY b.id DESC
+        LIMIT ?
+        """,
+        (limit,)
+    )
+
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_all_user_ids():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT telegram_id FROM users WHERE is_blocked = 0")
+    rows = cur.fetchall()
+
+    conn.close()
+    return [row[0] for row in rows]
 
 
 # ===================== STATES =====================
@@ -212,8 +326,11 @@ class BookingState(StatesGroup):
 
 
 class AdminState(StatesGroup):
-    waiting_user_id = State()
+    waiting_user_id_for_stars = State()
     waiting_star_amount = State()
+    waiting_broadcast_text = State()
+    waiting_block_user_id = State()
+    waiting_unblock_user_id = State()
 
 
 # ===================== MENUS =====================
@@ -248,16 +365,42 @@ def confirm_menu():
 def admin_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="📊 Statistika", callback_data="admin_stats")
+    kb.button(text="👥 Userlar", callback_data="admin_users")
+    kb.button(text="🏪 Do‘konlar", callback_data="admin_stores")
+    kb.button(text="📦 Bronlar", callback_data="admin_bookings")
     kb.button(text="⭐ Userga yulduz qo‘shish", callback_data="admin_add_stars")
+    kb.button(text="📢 Hammaga xabar yuborish", callback_data="admin_broadcast")
+    kb.button(text="🚫 User bloklash", callback_data="admin_block_user")
+    kb.button(text="✅ Blokdan chiqarish", callback_data="admin_unblock_user")
     kb.adjust(1)
     return kb.as_markup()
+
+
+# ===================== HELPERS =====================
+
+def admin_check(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+
+async def blocked_guard(message: Message) -> bool:
+    if is_blocked(message.from_user.id):
+        await message.answer("Siz botdan foydalanishdan bloklangansiz.")
+        return True
+    return False
 
 
 # ===================== USER COMMANDS =====================
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    add_user(message.from_user.id, message.from_user.full_name)
+    add_user(
+        telegram_id=message.from_user.id,
+        full_name=message.from_user.full_name,
+        username=message.from_user.username
+    )
+
+    if await blocked_guard(message):
+        return
 
     await message.answer(
         "Assalomu alaykum!\n\n"
@@ -274,7 +417,7 @@ async def my_id(message: Message):
 
 @dp.message(Command("admin"))
 async def admin(message: Message):
-    if message.from_user.id != ADMIN_ID:
+    if not admin_check(message.from_user.id):
         await message.answer("Siz admin emassiz.")
         return
 
@@ -285,6 +428,11 @@ async def admin(message: Message):
 
 @dp.callback_query(F.data == "connect_store")
 async def connect_store(callback: CallbackQuery, state: FSMContext):
+    if is_blocked(callback.from_user.id):
+        await callback.message.answer("Siz botdan foydalanishdan bloklangansiz.")
+        await callback.answer()
+        return
+
     await callback.message.answer(
         "Do‘koningizni ulash uchun:\n\n"
         "1. Uzum Seller paneliga kiring\n"
@@ -300,6 +448,10 @@ async def connect_store(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(StoreState.waiting_store_id)
 async def store_id_save(message: Message, state: FSMContext):
+    if await blocked_guard(message):
+        await state.clear()
+        return
+
     store_id = message.text.strip()
 
     if not store_id.isdigit():
@@ -322,6 +474,11 @@ async def store_id_save(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "new_booking")
 async def new_booking(callback: CallbackQuery, state: FSMContext):
+    if is_blocked(callback.from_user.id):
+        await callback.message.answer("Siz botdan foydalanishdan bloklangansiz.")
+        await callback.answer()
+        return
+
     telegram_id = callback.from_user.id
     store_id = get_store(telegram_id)
 
@@ -357,6 +514,10 @@ async def new_booking(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(BookingState.waiting_invoice)
 async def get_invoice(message: Message, state: FSMContext):
+    if await blocked_guard(message):
+        await state.clear()
+        return
+
     invoice = message.text.strip()
 
     if len(invoice) < 3:
@@ -391,6 +552,10 @@ async def date_custom(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(BookingState.waiting_custom_date)
 async def custom_date(message: Message, state: FSMContext):
+    if await blocked_guard(message):
+        await state.clear()
+        return
+
     await state.update_data(date=message.text.strip())
     await show_booking_confirm(message, message.from_user.id, state)
 
@@ -414,6 +579,12 @@ async def show_booking_confirm(message: Message, telegram_id: int, state: FSMCon
 
 @dp.callback_query(F.data == "confirm_booking")
 async def confirm_booking(callback: CallbackQuery, state: FSMContext):
+    if is_blocked(callback.from_user.id):
+        await callback.message.answer("Siz botdan foydalanishdan bloklangansiz.")
+        await state.clear()
+        await callback.answer()
+        return
+
     telegram_id = callback.from_user.id
     data = await state.get_data()
 
@@ -498,40 +669,134 @@ async def history(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+    if not admin_check(callback.from_user.id):
         await callback.answer("Ruxsat yo‘q.")
         return
 
-    users_count, stores_count, bookings_count = get_stats()
+    users_count, stores_count, bookings_count, blocked_count = get_stats()
 
     await callback.message.answer(
         "📊 Statistika:\n\n"
         f"👥 Userlar: {users_count}\n"
         f"🏪 Do‘konlar: {stores_count}\n"
-        f"📦 Bronlar: {bookings_count}",
+        f"📦 Bronlar: {bookings_count}\n"
+        f"🚫 Bloklanganlar: {blocked_count}",
         reply_markup=admin_menu()
     )
 
     await callback.answer()
 
 
-@dp.callback_query(F.data == "admin_add_stars")
-async def admin_add_stars(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
+@dp.callback_query(F.data == "admin_users")
+async def admin_users(callback: CallbackQuery):
+    if not admin_check(callback.from_user.id):
         await callback.answer("Ruxsat yo‘q.")
         return
 
-    await callback.message.answer(
-        "Yulduz qo‘shmoqchi bo‘lgan user Telegram ID sini yuboring:"
-    )
+    rows = get_all_users()
 
-    await state.set_state(AdminState.waiting_user_id)
+    if not rows:
+        await callback.message.answer("Userlar yo‘q.", reply_markup=admin_menu())
+        await callback.answer()
+        return
+
+    text = "👥 Oxirgi userlar:\n\n"
+
+    for row in rows:
+        telegram_id, full_name, username, stars, blocked, created_at = row
+        username_text = f"@{username}" if username else "username yo‘q"
+        status = "🚫 Blok" if blocked else "✅ Aktiv"
+
+        text += (
+            f"ID: {telegram_id}\n"
+            f"Ism: {full_name}\n"
+            f"Username: {username_text}\n"
+            f"⭐ Yulduz: {stars}\n"
+            f"Holat: {status}\n"
+            f"Sana: {created_at}\n\n"
+        )
+
+    await callback.message.answer(text, reply_markup=admin_menu())
     await callback.answer()
 
 
-@dp.message(AdminState.waiting_user_id)
-async def admin_get_user_id(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
+@dp.callback_query(F.data == "admin_stores")
+async def admin_stores(callback: CallbackQuery):
+    if not admin_check(callback.from_user.id):
+        await callback.answer("Ruxsat yo‘q.")
+        return
+
+    rows = get_all_stores()
+
+    if not rows:
+        await callback.message.answer("Ulangan do‘konlar yo‘q.", reply_markup=admin_menu())
+        await callback.answer()
+        return
+
+    text = "🏪 Oxirgi ulangan do‘konlar:\n\n"
+
+    for row in rows:
+        store_id, telegram_id, full_name, username, created_at = row
+        username_text = f"@{username}" if username else "username yo‘q"
+
+        text += (
+            f"Do‘kon ID: {store_id}\n"
+            f"User ID: {telegram_id}\n"
+            f"Ism: {full_name}\n"
+            f"Username: {username_text}\n"
+            f"Sana: {created_at}\n\n"
+        )
+
+    await callback.message.answer(text, reply_markup=admin_menu())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_bookings")
+async def admin_bookings(callback: CallbackQuery):
+    if not admin_check(callback.from_user.id):
+        await callback.answer("Ruxsat yo‘q.")
+        return
+
+    rows = get_all_bookings()
+
+    if not rows:
+        await callback.message.answer("Bronlar yo‘q.", reply_markup=admin_menu())
+        await callback.answer()
+        return
+
+    text = "📦 Oxirgi bronlar:\n\n"
+
+    for row in rows:
+        telegram_id, full_name, store_id, invoice, date, status, created_at = row
+
+        text += (
+            f"User ID: {telegram_id}\n"
+            f"Ism: {full_name}\n"
+            f"Do‘kon ID: {store_id}\n"
+            f"Invoice: {invoice}\n"
+            f"Sana: {date}\n"
+            f"Holat: {status}\n"
+            f"Vaqt: {created_at}\n\n"
+        )
+
+    await callback.message.answer(text, reply_markup=admin_menu())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_add_stars")
+async def admin_add_stars(callback: CallbackQuery, state: FSMContext):
+    if not admin_check(callback.from_user.id):
+        await callback.answer("Ruxsat yo‘q.")
+        return
+
+    await callback.message.answer("Yulduz qo‘shmoqchi bo‘lgan user Telegram ID sini yuboring:")
+    await state.set_state(AdminState.waiting_user_id_for_stars)
+    await callback.answer()
+
+
+@dp.message(AdminState.waiting_user_id_for_stars)
+async def admin_get_user_id_for_stars(message: Message, state: FSMContext):
+    if not admin_check(message.from_user.id):
         return
 
     user_id = message.text.strip()
@@ -547,7 +812,7 @@ async def admin_get_user_id(message: Message, state: FSMContext):
 
 @dp.message(AdminState.waiting_star_amount)
 async def admin_get_star_amount(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
+    if not admin_check(message.from_user.id):
         return
 
     amount = message.text.strip()
@@ -570,10 +835,123 @@ async def admin_get_star_amount(message: Message, state: FSMContext):
     )
 
     try:
-        await bot.send_message(
-            target_user_id,
-            f"⭐ Balansingizga {amount} yulduz qo‘shildi."
-        )
+        await bot.send_message(target_user_id, f"⭐ Balansingizga {amount} yulduz qo‘shildi.")
+    except Exception:
+        pass
+
+    await state.clear()
+
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast(callback: CallbackQuery, state: FSMContext):
+    if not admin_check(callback.from_user.id):
+        await callback.answer("Ruxsat yo‘q.")
+        return
+
+    await callback.message.answer("Hammaga yuboriladigan xabar matnini kiriting:")
+    await state.set_state(AdminState.waiting_broadcast_text)
+    await callback.answer()
+
+
+@dp.message(AdminState.waiting_broadcast_text)
+async def admin_send_broadcast(message: Message, state: FSMContext):
+    if not admin_check(message.from_user.id):
+        return
+
+    text = message.text
+    user_ids = get_all_user_ids()
+
+    sent = 0
+    failed = 0
+
+    for user_id in user_ids:
+        try:
+            await bot.send_message(user_id, f"📢 Xabar:\n\n{text}")
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+
+    await message.answer(
+        f"📢 Xabar yuborish tugadi.\n\n"
+        f"✅ Yuborildi: {sent}\n"
+        f"❌ Yuborilmadi: {failed}",
+        reply_markup=admin_menu()
+    )
+
+    await state.clear()
+
+
+@dp.callback_query(F.data == "admin_block_user")
+async def admin_block_user(callback: CallbackQuery, state: FSMContext):
+    if not admin_check(callback.from_user.id):
+        await callback.answer("Ruxsat yo‘q.")
+        return
+
+    await callback.message.answer("Bloklamoqchi bo‘lgan user Telegram ID sini yuboring:")
+    await state.set_state(AdminState.waiting_block_user_id)
+    await callback.answer()
+
+
+@dp.message(AdminState.waiting_block_user_id)
+async def admin_block_user_id(message: Message, state: FSMContext):
+    if not admin_check(message.from_user.id):
+        return
+
+    user_id = message.text.strip()
+
+    if not user_id.isdigit():
+        await message.answer("Telegram ID faqat raqam bo‘lishi kerak. Qayta kiriting:")
+        return
+
+    set_block_status(int(user_id), 1)
+
+    await message.answer(
+        f"🚫 User bloklandi.\n\n"
+        f"User ID: {user_id}",
+        reply_markup=admin_menu()
+    )
+
+    try:
+        await bot.send_message(int(user_id), "🚫 Siz botdan foydalanishdan bloklandingiz.")
+    except Exception:
+        pass
+
+    await state.clear()
+
+
+@dp.callback_query(F.data == "admin_unblock_user")
+async def admin_unblock_user(callback: CallbackQuery, state: FSMContext):
+    if not admin_check(callback.from_user.id):
+        await callback.answer("Ruxsat yo‘q.")
+        return
+
+    await callback.message.answer("Blokdan chiqariladigan user Telegram ID sini yuboring:")
+    await state.set_state(AdminState.waiting_unblock_user_id)
+    await callback.answer()
+
+
+@dp.message(AdminState.waiting_unblock_user_id)
+async def admin_unblock_user_id(message: Message, state: FSMContext):
+    if not admin_check(message.from_user.id):
+        return
+
+    user_id = message.text.strip()
+
+    if not user_id.isdigit():
+        await message.answer("Telegram ID faqat raqam bo‘lishi kerak. Qayta kiriting:")
+        return
+
+    set_block_status(int(user_id), 0)
+
+    await message.answer(
+        f"✅ User blokdan chiqarildi.\n\n"
+        f"User ID: {user_id}",
+        reply_markup=admin_menu()
+    )
+
+    try:
+        await bot.send_message(int(user_id), "✅ Siz botda qayta foydalanishingiz mumkin.")
     except Exception:
         pass
 
