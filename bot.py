@@ -325,8 +325,15 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
-async def main():
     @dp.message(Command("myid"))
 async def my_id(message: Message):
     await message.answer(f"Sizning Telegram ID: {message.from_user.id}")
+
+
+async def main():
+    print("Bot ishga tushdi...")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
