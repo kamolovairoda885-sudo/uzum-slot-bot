@@ -1,10 +1,13 @@
 import asyncio
 import os
+import sqlite3
+from datetime import datetime
+
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -13,26 +16,207 @@ from aiogram.fsm.context import FSMContext
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = os.getenv("ADMIN_ID")
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN topilmadi. Railway Variables ichiga BOT_TOKEN qo‘ying.")
+
+ADMIN_ID = int(ADMIN_ID) if ADMIN_ID and ADMIN_ID.isdigit() else 0
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-
-# Vaqtincha oddiy xotira bazasi
-users = {}
-stores = {}
-bookings = {}
+DB_NAME = "bot.db"
 
 
-class RegisterStore(StatesGroup):
+# ===================== DATABASE =====================
+
+def db():
+    return sqlite3.connect(DB_NAME)
+
+
+def init_db():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            telegram_id INTEGER PRIMARY KEY,
+            full_name TEXT,
+            stars INTEGER DEFAULT 1,
+            created_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS stores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER,
+            store_id TEXT,
+            created_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS bookings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER,
+            store_id TEXT,
+            invoice TEXT,
+            date TEXT,
+            status TEXT,
+            created_at TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def add_user(telegram_id: int, full_name: str):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT telegram_id FROM users WHERE telegram_id = ?", (telegram_id,))
+    exists = cur.fetchone()
+
+    if not exists:
+        cur.execute(
+            "INSERT INTO users (telegram_id, full_name, stars, created_at) VALUES (?, ?, ?, ?)",
+            (telegram_id, full_name, 1, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def get_stars(telegram_id: int) -> int:
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT stars FROM users WHERE telegram_id = ?", (telegram_id,))
+    row = cur.fetchone()
+
+    conn.close()
+    return row[0] if row else 0
+
+
+def change_stars(telegram_id: int, amount: int):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "UPDATE users SET stars = stars + ? WHERE telegram_id = ?",
+        (amount, telegram_id)
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def save_store(telegram_id: int, store_id: str):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("DELETE FROM stores WHERE telegram_id = ?", (telegram_id,))
+    cur.execute(
+        "INSERT INTO stores (telegram_id, store_id, created_at) VALUES (?, ?, ?)",
+        (telegram_id, store_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def get_store(telegram_id: int):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT store_id FROM stores WHERE telegram_id = ?", (telegram_id,))
+    row = cur.fetchone()
+
+    conn.close()
+    return row[0] if row else None
+
+
+def save_booking(telegram_id: int, store_id: str, invoice: str, date: str, status: str):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT INTO bookings (telegram_id, store_id, invoice, date, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            telegram_id,
+            store_id,
+            invoice,
+            date,
+            status,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def get_user_bookings(telegram_id: int):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT store_id, invoice, date, status, created_at
+        FROM bookings
+        WHERE telegram_id = ?
+        ORDER BY id DESC
+        LIMIT 10
+        """,
+        (telegram_id,)
+    )
+
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_stats():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM users")
+    users_count = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM stores")
+    stores_count = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM bookings")
+    bookings_count = cur.fetchone()[0]
+
+    conn.close()
+    return users_count, stores_count, bookings_count
+
+
+# ===================== STATES =====================
+
+class StoreState(StatesGroup):
     waiting_store_id = State()
 
 
-class NewBooking(StatesGroup):
+class BookingState(StatesGroup):
     waiting_invoice = State()
-    waiting_date = State()
-    confirm = State()
+    waiting_custom_date = State()
+    confirming = State()
 
+
+class AdminState(StatesGroup):
+    waiting_user_id = State()
+    waiting_star_amount = State()
+
+
+# ===================== MENUS =====================
 
 def main_menu():
     kb = InlineKeyboardBuilder()
@@ -44,63 +228,60 @@ def main_menu():
     return kb.as_markup()
 
 
-def language_menu():
+def date_menu():
     kb = InlineKeyboardBuilder()
-    kb.button(text="🇺🇿 O‘zbekcha", callback_data="lang_uz")
-    kb.button(text="🇷🇺 Русский", callback_data="lang_ru")
+    kb.button(text="Bugun", callback_data="date_today")
+    kb.button(text="Ertaga", callback_data="date_tomorrow")
+    kb.button(text="Boshqa sana", callback_data="date_custom")
     kb.adjust(1)
     return kb.as_markup()
 
 
+def confirm_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Tasdiqlash", callback_data="confirm_booking")
+    kb.button(text="❌ Bekor qilish", callback_data="cancel_booking")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def admin_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📊 Statistika", callback_data="admin_stats")
+    kb.button(text="⭐ Userga yulduz qo‘shish", callback_data="admin_add_stars")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+# ===================== USER COMMANDS =====================
+
 @dp.message(CommandStart())
 async def start(message: Message):
-    user_id = message.from_user.id
-
-    users[user_id] = {
-        "name": message.from_user.full_name,
-        "stars": 1,
-        "language": None
-    }
+    add_user(message.from_user.id, message.from_user.full_name)
 
     await message.answer(
         "Assalomu alaykum!\n\n"
-        "Uzum Time Slot botiga xush kelibsiz.\n\n"
-        "Tilni tanlang:",
-        reply_markup=language_menu()
-    )
-
-
-@dp.callback_query(F.data == "lang_uz")
-async def set_lang_uz(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    users.setdefault(user_id, {})
-    users[user_id]["language"] = "uz"
-    users[user_id].setdefault("stars", 1)
-
-    await callback.message.answer(
-        "Xush kelibsiz!\n\n"
-        "Sizga 1 ta bepul yulduz berildi.\n"
-        "Har bir muvaffaqiyatli bron 1 yulduzga teng.",
+        "Uzum Time Slot botiga xush kelibsiz ✅\n\n"
+        "Quyidagi menyudan foydalaning:",
         reply_markup=main_menu()
     )
-    await callback.answer()
 
 
-@dp.callback_query(F.data == "lang_ru")
-async def set_lang_ru(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    users.setdefault(user_id, {})
-    users[user_id]["language"] = "ru"
-    users[user_id].setdefault("stars", 1)
+@dp.message(Command("myid"))
+async def my_id(message: Message):
+    await message.answer(f"Sizning Telegram ID: {message.from_user.id}")
 
-    await callback.message.answer(
-        "Добро пожаловать!\n\n"
-        "Вам начислена 1 бесплатная звезда.\n"
-        "Каждая успешная бронь = 1 звезда.",
-        reply_markup=main_menu()
-    )
-    await callback.answer()
 
+@dp.message(Command("admin"))
+async def admin(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Siz admin emassiz.")
+        return
+
+    await message.answer("Admin panel:", reply_markup=admin_menu())
+
+
+# ===================== STORE =====================
 
 @dp.callback_query(F.data == "connect_store")
 async def connect_store(callback: CallbackQuery, state: FSMContext):
@@ -112,23 +293,20 @@ async def connect_store(callback: CallbackQuery, state: FSMContext):
         "4. Keyin do‘kon ID raqamini yuboring.\n\n"
         "Do‘kon ID raqamini kiriting:"
     )
-    await state.set_state(RegisterStore.waiting_store_id)
+
+    await state.set_state(StoreState.waiting_store_id)
     await callback.answer()
 
 
-@dp.message(RegisterStore.waiting_store_id)
-async def save_store_id(message: Message, state: FSMContext):
-    user_id = message.from_user.id
+@dp.message(StoreState.waiting_store_id)
+async def store_id_save(message: Message, state: FSMContext):
     store_id = message.text.strip()
 
     if not store_id.isdigit():
         await message.answer("Do‘kon ID faqat raqamlardan iborat bo‘lishi kerak. Qayta kiriting:")
         return
 
-    stores[user_id] = {
-        "store_id": store_id,
-        "status": "connected"
-    }
+    save_store(message.from_user.id, store_id)
 
     await message.answer(
         f"✅ Do‘kon muvaffaqiyatli ulandi!\n\n"
@@ -136,14 +314,18 @@ async def save_store_id(message: Message, state: FSMContext):
         f"Endi bron qilishingiz mumkin.",
         reply_markup=main_menu()
     )
+
     await state.clear()
 
 
+# ===================== BOOKING =====================
+
 @dp.callback_query(F.data == "new_booking")
 async def new_booking(callback: CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
+    telegram_id = callback.from_user.id
+    store_id = get_store(telegram_id)
 
-    if user_id not in stores:
+    if not store_id:
         await callback.message.answer(
             "Avval do‘koningizni ulang.",
             reply_markup=main_menu()
@@ -151,7 +333,7 @@ async def new_booking(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    stars = users.get(user_id, {}).get("stars", 0)
+    stars = get_stars(telegram_id)
 
     if stars <= 0:
         await callback.message.answer(
@@ -168,104 +350,98 @@ async def new_booking(callback: CallbackQuery, state: FSMContext):
         "Bir nechta invoice bo‘lsa vergul bilan yozing:\n"
         "110003500721, 110003105384"
     )
-    await state.set_state(NewBooking.waiting_invoice)
+
+    await state.set_state(BookingState.waiting_invoice)
     await callback.answer()
 
 
-@dp.message(NewBooking.waiting_invoice)
+@dp.message(BookingState.waiting_invoice)
 async def get_invoice(message: Message, state: FSMContext):
     invoice = message.text.strip()
 
-    if len(invoice) < 5:
-        await message.answer("Invoice raqami noto‘g‘ri ko‘rinadi. Qayta kiriting:")
+    if len(invoice) < 3:
+        await message.answer("Invoice noto‘g‘ri ko‘rinadi. Qayta kiriting:")
         return
 
     await state.update_data(invoice=invoice)
 
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Bugun", callback_data="date_today")
-    kb.button(text="Ertaga", callback_data="date_tomorrow")
-    kb.button(text="Boshqa sana", callback_data="date_custom")
-    kb.adjust(1)
-
-    await message.answer("Sanani tanlang:", reply_markup=kb.as_markup())
+    await message.answer("Sanani tanlang:", reply_markup=date_menu())
 
 
 @dp.callback_query(F.data == "date_today")
 async def date_today(callback: CallbackQuery, state: FSMContext):
     await state.update_data(date="Bugun")
-    await show_confirm(callback, state)
+    await show_booking_confirm(callback.message, callback.from_user.id, state)
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "date_tomorrow")
 async def date_tomorrow(callback: CallbackQuery, state: FSMContext):
     await state.update_data(date="Ertaga")
-    await show_confirm(callback, state)
+    await show_booking_confirm(callback.message, callback.from_user.id, state)
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "date_custom")
 async def date_custom(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer("Sanani yozing. Masalan: 14.05.2026")
-    await state.set_state(NewBooking.waiting_date)
+    await state.set_state(BookingState.waiting_custom_date)
     await callback.answer()
 
 
-@dp.message(NewBooking.waiting_date)
+@dp.message(BookingState.waiting_custom_date)
 async def custom_date(message: Message, state: FSMContext):
     await state.update_data(date=message.text.strip())
-
-    class FakeCallback:
-        def __init__(self, message):
-            self.message = message
-
-        async def answer(self):
-            pass
-
-    await show_confirm(FakeCallback(message), state)
+    await show_booking_confirm(message, message.from_user.id, state)
 
 
-async def show_confirm(callback: CallbackQuery, state: FSMContext):
+async def show_booking_confirm(message: Message, telegram_id: int, state: FSMContext):
     data = await state.get_data()
-    user_id = callback.message.chat.id
-    store = stores.get(user_id, {})
+    store_id = get_store(telegram_id)
 
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Tasdiqlash", callback_data="confirm_booking")
-    kb.button(text="❌ Bekor qilish", callback_data="cancel_booking")
-    kb.adjust(1)
-
-    await callback.message.answer(
+    await message.answer(
         "📋 Bron ma’lumotlari:\n\n"
-        f"🏪 Do‘kon ID: {store.get('store_id')}\n"
+        f"🏪 Do‘kon ID: {store_id}\n"
         f"📦 Invoice: {data.get('invoice')}\n"
         f"📅 Sana: {data.get('date')}\n"
         f"⭐ Sarflanadi: 1 yulduz\n\n"
         "Tasdiqlaysizmi?",
-        reply_markup=kb.as_markup()
+        reply_markup=confirm_menu()
     )
-    await state.set_state(NewBooking.confirm)
+
+    await state.set_state(BookingState.confirming)
 
 
 @dp.callback_query(F.data == "confirm_booking")
 async def confirm_booking(callback: CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
+    telegram_id = callback.from_user.id
     data = await state.get_data()
 
-    booking_id = len(bookings) + 1
+    store_id = get_store(telegram_id)
+    stars = get_stars(telegram_id)
 
-    bookings[booking_id] = {
-        "user_id": user_id,
-        "store_id": stores[user_id]["store_id"],
-        "invoice": data.get("invoice"),
-        "date": data.get("date"),
-        "status": "searching"
-    }
+    if stars <= 0:
+        await callback.message.answer("Balansingizda yulduz yo‘q.")
+        await state.clear()
+        await callback.answer()
+        return
+
+    save_booking(
+        telegram_id=telegram_id,
+        store_id=store_id,
+        invoice=data.get("invoice"),
+        date=data.get("date"),
+        status="searching"
+    )
+
+    change_stars(telegram_id, -1)
 
     await callback.message.answer(
         "✅ Bron jarayoni boshlandi!\n\n"
         "🔍 Slot qidirilmoqda...\n"
         "Bu bir necha daqiqa davom etishi mumkin.\n\n"
-        "Hozircha bu MVP test rejimi. Keyingi bosqichda Uzum API ulanadi."
+        "Hozircha bu MVP test rejimi. Keyingi bosqichda Uzum API ulanadi.",
+        reply_markup=main_menu()
     )
 
     await state.clear()
@@ -279,58 +455,135 @@ async def cancel_booking(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+# ===================== BALANCE / HISTORY =====================
+
 @dp.callback_query(F.data == "balance")
 async def balance(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    stars = users.get(user_id, {}).get("stars", 0)
+    stars = get_stars(callback.from_user.id)
 
     await callback.message.answer(
         f"⭐ Sizning balansingiz: {stars} yulduz",
         reply_markup=main_menu()
     )
+
     await callback.answer()
 
 
 @dp.callback_query(F.data == "history")
 async def history(callback: CallbackQuery):
-    user_id = callback.from_user.id
+    rows = get_user_bookings(callback.from_user.id)
 
-    user_bookings = [
-        b for b in bookings.values()
-        if b["user_id"] == user_id
-    ]
-
-    if not user_bookings:
+    if not rows:
         await callback.message.answer("Sizda hali bronlar yo‘q.", reply_markup=main_menu())
         await callback.answer()
         return
 
-    text = "📜 Bronlar tarixi:\n\n"
+    text = "📜 Oxirgi bronlar tarixi:\n\n"
 
-    for b in user_bookings:
+    for row in rows:
+        store_id, invoice, date, status, created_at = row
         text += (
-            f"🏪 Do‘kon ID: {b['store_id']}\n"
-            f"📦 Invoice: {b['invoice']}\n"
-            f"📅 Sana: {b['date']}\n"
-            f"Holat: {b['status']}\n\n"
+            f"🏪 Do‘kon ID: {store_id}\n"
+            f"📦 Invoice: {invoice}\n"
+            f"📅 Sana: {date}\n"
+            f"Holat: {status}\n"
+            f"Vaqt: {created_at}\n\n"
         )
 
     await callback.message.answer(text, reply_markup=main_menu())
     await callback.answer()
 
 
+# ===================== ADMIN PANEL =====================
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Ruxsat yo‘q.")
+        return
+
+    users_count, stores_count, bookings_count = get_stats()
+
+    await callback.message.answer(
+        "📊 Statistika:\n\n"
+        f"👥 Userlar: {users_count}\n"
+        f"🏪 Do‘konlar: {stores_count}\n"
+        f"📦 Bronlar: {bookings_count}",
+        reply_markup=admin_menu()
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_add_stars")
+async def admin_add_stars(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Ruxsat yo‘q.")
+        return
+
+    await callback.message.answer(
+        "Yulduz qo‘shmoqchi bo‘lgan user Telegram ID sini yuboring:"
+    )
+
+    await state.set_state(AdminState.waiting_user_id)
+    await callback.answer()
+
+
+@dp.message(AdminState.waiting_user_id)
+async def admin_get_user_id(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    user_id = message.text.strip()
+
+    if not user_id.isdigit():
+        await message.answer("Telegram ID faqat raqam bo‘lishi kerak. Qayta kiriting:")
+        return
+
+    await state.update_data(target_user_id=int(user_id))
+    await message.answer("Nechta yulduz qo‘shamiz? Masalan: 5")
+    await state.set_state(AdminState.waiting_star_amount)
+
+
+@dp.message(AdminState.waiting_star_amount)
+async def admin_get_star_amount(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    amount = message.text.strip()
+
+    if not amount.lstrip("-").isdigit():
+        await message.answer("Yulduz soni raqam bo‘lishi kerak. Masalan: 5")
+        return
+
+    data = await state.get_data()
+    target_user_id = data.get("target_user_id")
+    amount = int(amount)
+
+    change_stars(target_user_id, amount)
+
+    await message.answer(
+        f"✅ Userga yulduz qo‘shildi.\n\n"
+        f"User ID: {target_user_id}\n"
+        f"Qo‘shilgan yulduz: {amount}",
+        reply_markup=admin_menu()
+    )
+
+    try:
+        await bot.send_message(
+            target_user_id,
+            f"⭐ Balansingizga {amount} yulduz qo‘shildi."
+        )
+    except Exception:
+        pass
+
+    await state.clear()
+
+
+# ===================== RUN =====================
+
 async def main():
-    print("Bot ishga tushdi...")
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    @dp.message(Command("myid"))
-async def my_id(message: Message):
-    await message.answer(f"Sizning Telegram ID: {message.from_user.id}")
-
-
-async def main():
+    init_db()
     print("Bot ishga tushdi...")
     await dp.start_polling(bot)
 
