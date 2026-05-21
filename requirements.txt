@@ -1,1 +1,1 @@
-python-telegram-bot[http2]==20.7
+python-telegram-bot==20.7
