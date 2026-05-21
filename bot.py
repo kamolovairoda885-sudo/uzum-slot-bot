@@ -1,330 +1,328 @@
+import asyncio
 import os
-import json
-import logging
-from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes, ConversationHandler
-)
+from dotenv import load_dotenv
 
-# --- SOZLAMALAR ---
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "6211403603"))
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.filters import CommandStart
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
 
-# Fayl - bronlar saqlanadi
-BOOKINGS_FILE = "bookings.json"
 
-# Conversation states
-CHOOSING_DATE, CHOOSING_SLOT, ENTERING_NAME, ENTERING_PHONE, ENTERING_CAR = range(5)
+load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# --- YORDAMCHI FUNKSIYALAR ---
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
-def load_bookings():
-    if os.path.exists(BOOKINGS_FILE):
-        with open(BOOKINGS_FILE, "r") as f:
-            return json.load(f)
-    return {}
 
-def save_bookings(bookings):
-    with open(BOOKINGS_FILE, "w") as f:
-        json.dump(bookings, f, ensure_ascii=False, indent=2)
+# Vaqtincha oddiy xotira bazasi
+users = {}
+stores = {}
+bookings = {}
 
-def get_available_slots(date_str):
-    """Sana uchun bo'sh slotlarni qaytaradi"""
-    # Vaqt slotlari - bularni o'zgartirishingiz mumkin
-    all_slots = [
-        "08:00", "09:00", "10:00", "11:00",
-        "12:00", "13:00", "14:00", "15:00",
-        "16:00", "17:00", "18:00"
-    ]
-    bookings = load_bookings()
-    booked = bookings.get(date_str, {}).keys()
-    available = [s for s in all_slots if s not in booked]
-    return available
 
-def get_next_days(n=7):
-    """Keyingi n kunni qaytaradi"""
-    days = []
-    today = datetime.now()
-    for i in range(n):
-        day = today + timedelta(days=i)
-        days.append(day.strftime("%Y-%m-%d"))
-    return days
+class RegisterStore(StatesGroup):
+    waiting_store_id = State()
 
-def format_date(date_str):
-    """2024-05-21 → 21-May (Seshanba)"""
-    dt = datetime.strptime(date_str, "%Y-%m-%d")
-    weekdays = ["Dushanba", "Seshanba", "Chorshanba", "Payshanba", "Juma", "Shanba", "Yakshanba"]
-    months = ["", "Yanvar", "Fevral", "Mart", "Aprel", "May", "Iyun",
-              "Iyul", "Avgust", "Sentabr", "Oktabr", "Noyabr", "Dekabr"]
-    return f"{dt.day} {months[dt.month]} ({weekdays[dt.weekday()]})"
 
-# --- HANDLERS ---
+class NewBooking(StatesGroup):
+    waiting_invoice = State()
+    waiting_date = State()
+    confirm = State()
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    keyboard = [
-        [InlineKeyboardButton("📅 Slot bron qilish", callback_data="book")],
-        [InlineKeyboardButton("📋 Mening bronlarim", callback_data="my_bookings")],
-    ]
-    if update.effective_user.id == ADMIN_ID:
-        keyboard.append([InlineKeyboardButton("👑 Admin panel", callback_data="admin")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        f"Salom, {user.first_name}! 👋\n\n"
-        "📦 *Uzum ombori — Slot bron qilish boti*\n\n"
-        "Yuk tushirish/yuklash uchun qulay vaqt tanlang:",
-        parse_mode="Markdown",
-        reply_markup=reply_markup
-    )
-    return ConversationHandler.END
 
-async def book_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    days = get_next_days(7)
-    keyboard = []
-    for day in days:
-        available = get_available_slots(day)
-        if available:
-            btn_text = f"📅 {format_date(day)} ({len(available)} bo'sh)"
-            keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"date_{day}")])
-    
-    keyboard.append([InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel")])
-    
-    await query.edit_message_text(
-        "📅 *Sanani tanlang:*\n\n"
-        "Qaysi kuni kelmoqchisiz?",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    return CHOOSING_DATE
+def main_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🏪 Do‘kon ulash", callback_data="connect_store")
+    kb.button(text="📦 Yangi bron", callback_data="new_booking")
+    kb.button(text="⭐ Balans", callback_data="balance")
+    kb.button(text="📜 Bronlar tarixi", callback_data="history")
+    kb.adjust(1)
+    return kb.as_markup()
 
-async def choose_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    date_str = query.data.replace("date_", "")
-    context.user_data["chosen_date"] = date_str
-    
-    available = get_available_slots(date_str)
-    keyboard = []
-    row = []
-    for i, slot in enumerate(available):
-        row.append(InlineKeyboardButton(f"🕐 {slot}", callback_data=f"slot_{slot}"))
-        if len(row) == 3:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="book")])
-    
-    await query.edit_message_text(
-        f"📅 *{format_date(date_str)}*\n\n"
-        "🕐 *Vaqtni tanlang:*",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    return CHOOSING_SLOT
 
-async def choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    slot = query.data.replace("slot_", "")
-    context.user_data["chosen_slot"] = slot
-    
-    await query.edit_message_text(
-        f"✅ Vaqt: *{format_date(context.user_data['chosen_date'])}* soat *{slot}*\n\n"
-        "👤 Ism-familiyangizni kiriting:",
-        parse_mode="Markdown"
-    )
-    return ENTERING_NAME
+def language_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🇺🇿 O‘zbekcha", callback_data="lang_uz")
+    kb.button(text="🇷🇺 Русский", callback_data="lang_ru")
+    kb.adjust(1)
+    return kb.as_markup()
 
-async def enter_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["name"] = update.message.text
-    await update.message.reply_text("📞 Telefon raqamingizni kiriting:\n\n_Masalan: +998901234567_", parse_mode="Markdown")
-    return ENTERING_PHONE
 
-async def enter_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["phone"] = update.message.text
-    await update.message.reply_text("🚗 Mashina raqamini kiriting:\n\n_Masalan: 01A123BC_", parse_mode="Markdown")
-    return ENTERING_CAR
+@dp.message(CommandStart())
+async def start(message: Message):
+    user_id = message.from_user.id
 
-async def enter_car(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["car"] = update.message.text
-    
-    date_str = context.user_data["chosen_date"]
-    slot = context.user_data["chosen_slot"]
-    name = context.user_data["name"]
-    phone = context.user_data["phone"]
-    car = context.user_data["car"]
-    user_id = update.effective_user.id
-    
-    # Bronni saqlash
-    bookings = load_bookings()
-    if date_str not in bookings:
-        bookings[date_str] = {}
-    
-    bookings[date_str][slot] = {
-        "name": name,
-        "phone": phone,
-        "car": car,
-        "user_id": user_id,
-        "booked_at": datetime.now().strftime("%Y-%m-%d %H:%M")
+    users[user_id] = {
+        "name": message.from_user.full_name,
+        "stars": 1,
+        "language": None
     }
-    save_bookings(bookings)
-    
-    # Foydalanuvchiga tasdiqlash
-    await update.message.reply_text(
-        "✅ *Bron tasdiqlandi!*\n\n"
-        f"📅 Sana: *{format_date(date_str)}*\n"
-        f"🕐 Vaqt: *{slot}*\n"
-        f"👤 Ism: *{name}*\n"
-        f"📞 Tel: *{phone}*\n"
-        f"🚗 Mashina: *{car}*\n\n"
-        "Vaqtingizda keling! 🙏",
-        parse_mode="Markdown"
-    )
-    
-    # Adminga xabar
-    await update.get_bot().send_message(
-        chat_id=ADMIN_ID,
-        text=f"🆕 *Yangi bron!*\n\n"
-             f"📅 Sana: *{format_date(date_str)}*\n"
-             f"🕐 Vaqt: *{slot}*\n"
-             f"👤 Ism: *{name}*\n"
-             f"📞 Tel: *{phone}*\n"
-             f"🚗 Mashina: *{car}*\n"
-             f"🆔 Telegram ID: `{user_id}`",
-        parse_mode="Markdown"
-    )
-    
-    return ConversationHandler.END
 
-async def my_bookings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = update.effective_user.id
-    bookings = load_bookings()
-    
-    user_bookings = []
-    for date_str, slots in bookings.items():
-        for slot, info in slots.items():
-            if info["user_id"] == user_id:
-                user_bookings.append((date_str, slot, info))
-    
+    await message.answer(
+        "Assalomu alaykum!\n\n"
+        "Uzum Time Slot botiga xush kelibsiz.\n\n"
+        "Tilni tanlang:",
+        reply_markup=language_menu()
+    )
+
+
+@dp.callback_query(F.data == "lang_uz")
+async def set_lang_uz(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    users.setdefault(user_id, {})
+    users[user_id]["language"] = "uz"
+    users[user_id].setdefault("stars", 1)
+
+    await callback.message.answer(
+        "Xush kelibsiz!\n\n"
+        "Sizga 1 ta bepul yulduz berildi.\n"
+        "Har bir muvaffaqiyatli bron 1 yulduzga teng.",
+        reply_markup=main_menu()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "lang_ru")
+async def set_lang_ru(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    users.setdefault(user_id, {})
+    users[user_id]["language"] = "ru"
+    users[user_id].setdefault("stars", 1)
+
+    await callback.message.answer(
+        "Добро пожаловать!\n\n"
+        "Вам начислена 1 бесплатная звезда.\n"
+        "Каждая успешная бронь = 1 звезда.",
+        reply_markup=main_menu()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "connect_store")
+async def connect_store(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer(
+        "Do‘koningizni ulash uchun:\n\n"
+        "1. Uzum Seller paneliga kiring\n"
+        "2. Xodimlar bo‘limiga o‘ting\n"
+        "3. Bot uchun berilgan telefon raqamni xodim sifatida qo‘shing\n"
+        "4. Keyin do‘kon ID raqamini yuboring.\n\n"
+        "Do‘kon ID raqamini kiriting:"
+    )
+    await state.set_state(RegisterStore.waiting_store_id)
+    await callback.answer()
+
+
+@dp.message(RegisterStore.waiting_store_id)
+async def save_store_id(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    store_id = message.text.strip()
+
+    if not store_id.isdigit():
+        await message.answer("Do‘kon ID faqat raqamlardan iborat bo‘lishi kerak. Qayta kiriting:")
+        return
+
+    stores[user_id] = {
+        "store_id": store_id,
+        "status": "connected"
+    }
+
+    await message.answer(
+        f"✅ Do‘kon muvaffaqiyatli ulandi!\n\n"
+        f"🏪 Do‘kon ID: {store_id}\n\n"
+        f"Endi bron qilishingiz mumkin.",
+        reply_markup=main_menu()
+    )
+    await state.clear()
+
+
+@dp.callback_query(F.data == "new_booking")
+async def new_booking(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+
+    if user_id not in stores:
+        await callback.message.answer(
+            "Avval do‘koningizni ulang.",
+            reply_markup=main_menu()
+        )
+        await callback.answer()
+        return
+
+    stars = users.get(user_id, {}).get("stars", 0)
+
+    if stars <= 0:
+        await callback.message.answer(
+            "Balansingizda yulduz yo‘q.\n"
+            "Bron qilish uchun balansni to‘ldiring."
+        )
+        await callback.answer()
+        return
+
+    await callback.message.answer(
+        "Invoice raqamini kiriting.\n\n"
+        "Masalan:\n"
+        "110003500721\n\n"
+        "Bir nechta invoice bo‘lsa vergul bilan yozing:\n"
+        "110003500721, 110003105384"
+    )
+    await state.set_state(NewBooking.waiting_invoice)
+    await callback.answer()
+
+
+@dp.message(NewBooking.waiting_invoice)
+async def get_invoice(message: Message, state: FSMContext):
+    invoice = message.text.strip()
+
+    if len(invoice) < 5:
+        await message.answer("Invoice raqami noto‘g‘ri ko‘rinadi. Qayta kiriting:")
+        return
+
+    await state.update_data(invoice=invoice)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Bugun", callback_data="date_today")
+    kb.button(text="Ertaga", callback_data="date_tomorrow")
+    kb.button(text="Boshqa sana", callback_data="date_custom")
+    kb.adjust(1)
+
+    await message.answer("Sanani tanlang:", reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data == "date_today")
+async def date_today(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(date="Bugun")
+    await show_confirm(callback, state)
+
+
+@dp.callback_query(F.data == "date_tomorrow")
+async def date_tomorrow(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(date="Ertaga")
+    await show_confirm(callback, state)
+
+
+@dp.callback_query(F.data == "date_custom")
+async def date_custom(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("Sanani yozing. Masalan: 14.05.2026")
+    await state.set_state(NewBooking.waiting_date)
+    await callback.answer()
+
+
+@dp.message(NewBooking.waiting_date)
+async def custom_date(message: Message, state: FSMContext):
+    await state.update_data(date=message.text.strip())
+
+    class FakeCallback:
+        def __init__(self, message):
+            self.message = message
+
+        async def answer(self):
+            pass
+
+    await show_confirm(FakeCallback(message), state)
+
+
+async def show_confirm(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    user_id = callback.message.chat.id
+    store = stores.get(user_id, {})
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Tasdiqlash", callback_data="confirm_booking")
+    kb.button(text="❌ Bekor qilish", callback_data="cancel_booking")
+    kb.adjust(1)
+
+    await callback.message.answer(
+        "📋 Bron ma’lumotlari:\n\n"
+        f"🏪 Do‘kon ID: {store.get('store_id')}\n"
+        f"📦 Invoice: {data.get('invoice')}\n"
+        f"📅 Sana: {data.get('date')}\n"
+        f"⭐ Sarflanadi: 1 yulduz\n\n"
+        "Tasdiqlaysizmi?",
+        reply_markup=kb.as_markup()
+    )
+    await state.set_state(NewBooking.confirm)
+
+
+@dp.callback_query(F.data == "confirm_booking")
+async def confirm_booking(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    data = await state.get_data()
+
+    booking_id = len(bookings) + 1
+
+    bookings[booking_id] = {
+        "user_id": user_id,
+        "store_id": stores[user_id]["store_id"],
+        "invoice": data.get("invoice"),
+        "date": data.get("date"),
+        "status": "searching"
+    }
+
+    await callback.message.answer(
+        "✅ Bron jarayoni boshlandi!\n\n"
+        "🔍 Slot qidirilmoqda...\n"
+        "Bu bir necha daqiqa davom etishi mumkin.\n\n"
+        "Hozircha bu MVP test rejimi. Keyingi bosqichda Uzum API ulanadi."
+    )
+
+    await state.clear()
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "cancel_booking")
+async def cancel_booking(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer("Bron bekor qilindi.", reply_markup=main_menu())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "balance")
+async def balance(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    stars = users.get(user_id, {}).get("stars", 0)
+
+    await callback.message.answer(
+        f"⭐ Sizning balansingiz: {stars} yulduz",
+        reply_markup=main_menu()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "history")
+async def history(callback: CallbackQuery):
+    user_id = callback.from_user.id
+
+    user_bookings = [
+        b for b in bookings.values()
+        if b["user_id"] == user_id
+    ]
+
     if not user_bookings:
-        await query.edit_message_text(
-            "📋 Sizda hozircha bron yo'q.\n\n"
-            "/start — bosh menyu",
+        await callback.message.answer("Sizda hali bronlar yo‘q.", reply_markup=main_menu())
+        await callback.answer()
+        return
+
+    text = "📜 Bronlar tarixi:\n\n"
+
+    for b in user_bookings:
+        text += (
+            f"🏪 Do‘kon ID: {b['store_id']}\n"
+            f"📦 Invoice: {b['invoice']}\n"
+            f"📅 Sana: {b['date']}\n"
+            f"Holat: {b['status']}\n\n"
         )
-        return
-    
-    text = "📋 *Sizning bronlaringiz:*\n\n"
-    for date_str, slot, info in sorted(user_bookings):
-        text += f"📅 {format_date(date_str)} — 🕐 {slot}\n"
-        text += f"🚗 {info['car']}\n\n"
-    
-    await query.edit_message_text(text, parse_mode="Markdown")
 
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    if update.effective_user.id != ADMIN_ID:
-        await query.answer("❌ Ruxsat yo'q!", show_alert=True)
-        return
-    
-    days = get_next_days(7)
-    keyboard = []
-    for day in days:
-        bookings = load_bookings()
-        count = len(bookings.get(day, {}))
-        btn_text = f"📅 {format_date(day)} — {count} ta bron"
-        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"admin_day_{day}")])
-    
-    keyboard.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="cancel")])
-    
-    await query.edit_message_text(
-        "👑 *Admin panel*\n\nKunni tanlang:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await callback.message.answer(text, reply_markup=main_menu())
+    await callback.answer()
 
-async def admin_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    if update.effective_user.id != ADMIN_ID:
-        return
-    
-    date_str = query.data.replace("admin_day_", "")
-    bookings = load_bookings()
-    day_bookings = bookings.get(date_str, {})
-    
-    if not day_bookings:
-        await query.edit_message_text(
-            f"📅 *{format_date(date_str)}*\n\n"
-            "Bu kun hozircha bron yo'q.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Orqaga", callback_data="admin")]])
-        )
-        return
-    
-    text = f"📅 *{format_date(date_str)}* bronlari:\n\n"
-    for slot in sorted(day_bookings.keys()):
-        info = day_bookings[slot]
-        text += f"🕐 *{slot}*\n"
-        text += f"  👤 {info['name']}\n"
-        text += f"  📞 {info['phone']}\n"
-        text += f"  🚗 {info['car']}\n\n"
-    
-    await query.edit_message_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Orqaga", callback_data="admin")]])
-    )
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("❌ Bekor qilindi. /start — bosh menyu")
-    return ConversationHandler.END
+async def main():
+    print("Bot ishga tushdi...")
+    await dp.start_polling(bot)
 
-# --- MAIN ---
-
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    
-    conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(book_start, pattern="^book$")],
-        states={
-            CHOOSING_DATE: [CallbackQueryHandler(choose_date, pattern="^date_")],
-            CHOOSING_SLOT: [CallbackQueryHandler(choose_slot, pattern="^slot_")],
-            ENTERING_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_name)],
-            ENTERING_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_phone)],
-            ENTERING_CAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_car)],
-        },
-        fallbacks=[CallbackQueryHandler(cancel, pattern="^cancel$")],
-    )
-    
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv_handler)
-    app.add_handler(CallbackQueryHandler(my_bookings, pattern="^my_bookings$"))
-    app.add_handler(CallbackQueryHandler(admin_panel, pattern="^admin$"))
-    app.add_handler(CallbackQueryHandler(admin_day, pattern="^admin_day_"))
-    app.add_handler(CallbackQueryHandler(cancel, pattern="^cancel$"))
-    
-    logger.info("Bot ishga tushdi!")
-    app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
