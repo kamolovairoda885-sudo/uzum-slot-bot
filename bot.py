@@ -1,9 +1,12 @@
 import asyncio
 import os
 import sqlite3
+import time
 from datetime import datetime
 
+import aiohttp
 from dotenv import load_dotenv
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery
@@ -16,7 +19,12 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
-EMPLOYEE_PHONE = os.getenv("EMPLOYEE_PHONE", "+998200276702")
+EMPLOYEE_PHONE = os.getenv("EMPLOYEE_PHONE", "+998 99 622 36 46")
+
+UZUM_AUTHORIZATION = os.getenv("UZUM_AUTHORIZATION")
+UZUM_COOKIE = os.getenv("UZUM_COOKIE")
+UZUM_POOL_SOURCE = os.getenv("UZUM_POOL_SOURCE", "FULFILLMENT")
+UZUM_STOCK_ID = int(os.getenv("UZUM_STOCK_ID", "34"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN topilmadi. Railway Variables ichiga BOT_TOKEN qo‘ying.")
@@ -74,6 +82,7 @@ def init_db():
             invoice TEXT,
             date TEXT,
             status TEXT,
+            result TEXT,
             created_at TEXT
         )
     """)
@@ -82,6 +91,8 @@ def init_db():
     ensure_column(cur, "users", "stars", "INTEGER DEFAULT 1")
     ensure_column(cur, "users", "is_blocked", "INTEGER DEFAULT 0")
     ensure_column(cur, "users", "created_at", "TEXT")
+
+    ensure_column(cur, "bookings", "result", "TEXT")
 
     conn.commit()
     conn.close()
@@ -171,15 +182,15 @@ def get_store(telegram_id):
     return row[0] if row else None
 
 
-def save_booking(telegram_id, store_id, invoice, date, status):
+def save_booking(telegram_id, store_id, invoice, date, status, result=""):
     conn = db()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO bookings (telegram_id, store_id, invoice, date, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO bookings (telegram_id, store_id, invoice, date, status, result, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (telegram_id, store_id, invoice, date, status, now())
+        (telegram_id, store_id, invoice, date, status, result, now())
     )
     conn.commit()
     conn.close()
@@ -190,7 +201,7 @@ def get_user_bookings(telegram_id):
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT store_id, invoice, date, status, created_at
+        SELECT store_id, invoice, date, status, result, created_at
         FROM bookings
         WHERE telegram_id = ?
         ORDER BY id DESC
@@ -263,7 +274,7 @@ def get_all_bookings(limit=20):
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT b.telegram_id, u.full_name, b.store_id, b.invoice, b.date, b.status, b.created_at
+        SELECT b.telegram_id, u.full_name, b.store_id, b.invoice, b.date, b.status, b.result, b.created_at
         FROM bookings b
         LEFT JOIN users u ON b.telegram_id = u.telegram_id
         ORDER BY b.id DESC
@@ -283,6 +294,127 @@ def get_all_user_ids():
     rows = cur.fetchall()
     conn.close()
     return [row[0] for row in rows]
+
+
+# ================= UZUM API =================
+
+def uzum_headers():
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0",
+    }
+
+    if UZUM_AUTHORIZATION:
+        headers["Authorization"] = UZUM_AUTHORIZATION
+
+    if UZUM_COOKIE:
+        headers["Cookie"] = UZUM_COOKIE
+
+    return headers
+
+
+def find_invoice_record(obj, invoice_number):
+    if isinstance(obj, dict):
+        if str(obj.get("invoiceNumber")) == str(invoice_number):
+            return obj
+
+        for value in obj.values():
+            result = find_invoice_record(value, invoice_number)
+            if result:
+                return result
+
+    if isinstance(obj, list):
+        for item in obj:
+            result = find_invoice_record(item, invoice_number)
+            if result:
+                return result
+
+    return None
+
+
+def find_timeslots(obj):
+    if isinstance(obj, dict):
+        if "timeSlots" in obj and isinstance(obj["timeSlots"], list):
+            return obj["timeSlots"]
+
+        for value in obj.values():
+            result = find_timeslots(value)
+            if result:
+                return result
+
+    if isinstance(obj, list):
+        for item in obj:
+            result = find_timeslots(item)
+            if result:
+                return result
+
+    return []
+
+
+async def uzum_find_invoice_id(shop_id: str, invoice_text: str):
+    invoice_text = invoice_text.strip()
+
+    if invoice_text.isdigit() and len(invoice_text) <= 8:
+        return int(invoice_text)
+
+    url = (
+        f"https://api-seller.uzum.uz/api/seller/shop/{shop_id}/invoice"
+        f"?page=0&size=20&invoiceNumber={invoice_text}"
+    )
+
+    async with aiohttp.ClientSession(headers=uzum_headers()) as session:
+        async with session.get(url) as response:
+            data = await response.json(content_type=None)
+
+            if response.status != 200:
+                raise Exception(f"Invoice qidirishda xato: {response.status}")
+
+            record = find_invoice_record(data, invoice_text)
+
+            if not record:
+                raise Exception("Invoice topilmadi.")
+
+            return int(record["id"])
+
+
+async def uzum_get_slots(shop_id: str, invoice_id: int):
+    url = f"https://api-seller.uzum.uz/api/seller/shop/{shop_id}/v2/invoice/time-slot/get"
+
+    payload = {
+        "invoiceIds": [invoice_id],
+        "poolSource": UZUM_POOL_SOURCE,
+        "timeFrom": int(time.time() * 1000)
+    }
+
+    async with aiohttp.ClientSession(headers=uzum_headers()) as session:
+        async with session.request("GET", url, json=payload) as response:
+            data = await response.json(content_type=None)
+
+            if response.status != 200:
+                raise Exception(f"Slot olishda xato: {response.status}")
+
+            return find_timeslots(data)
+
+
+async def uzum_set_slot(shop_id: str, invoice_id: int, time_from: int):
+    url = f"https://api-seller.uzum.uz/api/seller/shop/{shop_id}/v2/invoice/time-slot/set"
+
+    payload = {
+        "timeFrom": time_from,
+        "invoiceIds": [invoice_id],
+        "poolSource": UZUM_POOL_SOURCE,
+        "stockId": UZUM_STOCK_ID
+    }
+
+    async with aiohttp.ClientSession(headers=uzum_headers()) as session:
+        async with session.post(url, json=payload) as response:
+            data = await response.json(content_type=None)
+
+            if response.status != 200:
+                raise Exception(f"Slot saqlashda xato: {response.status}")
+
+            return data
 
 
 # ================= STATES =================
@@ -468,10 +600,11 @@ async def new_booking(callback: CallbackQuery, state: FSMContext):
 
     await callback.message.answer(
         "Invoice raqamini kiriting.\n\n"
-        "Masalan:\n"
-        "110003500721\n\n"
-        "Bir nechta invoice bo‘lsa vergul bilan yozing:\n"
-        "110003500721, 110003105384"
+        "2 xil ko‘rinishda yuborishingiz mumkin:\n\n"
+        "1) Invoice raqam:\n"
+        "110003534443\n\n"
+        "2) Invoice ID:\n"
+        "3534443"
     )
 
     await state.set_state(BookingState.waiting_invoice)
@@ -510,7 +643,7 @@ async def date_tomorrow(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "date_custom")
 async def date_custom(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer("Sanani yozing. Masalan: 14.05.2026")
+    await callback.message.answer("Sanani yozing. Masalan: 28.05.2026")
     await state.set_state(BookingState.waiting_custom_date)
     await callback.answer()
 
@@ -555,6 +688,7 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext):
 
     store_id = get_store(telegram_id)
     stars = get_stars(telegram_id)
+    invoice_text = data.get("invoice")
 
     if stars <= 0:
         await callback.message.answer("Balansingizda yulduz yo‘q.")
@@ -562,23 +696,81 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    save_booking(
-        telegram_id=telegram_id,
-        store_id=store_id,
-        invoice=data.get("invoice"),
-        date=data.get("date"),
-        status="searching"
-    )
-
-    change_stars(telegram_id, -1)
-
     await callback.message.answer(
-        "✅ Bron jarayoni boshlandi!\n\n"
-        "🔍 Slot qidirilmoqda...\n"
-        "Bu bir necha daqiqa davom etishi mumkin.\n\n"
-        "Hozircha bu MVP test rejimi. Keyingi bosqichda Uzum API ulanadi.",
-        reply_markup=main_menu()
+        "🔍 Real Uzum slot qidirish boshlandi...\n"
+        "Iltimos, kuting."
     )
+
+    try:
+        invoice_id = await uzum_find_invoice_id(store_id, invoice_text)
+
+        slots = await uzum_get_slots(store_id, invoice_id)
+
+        if not slots:
+            save_booking(
+                telegram_id=telegram_id,
+                store_id=store_id,
+                invoice=invoice_text,
+                date=data.get("date"),
+                status="no_slots",
+                result="Bo‘sh slot topilmadi"
+            )
+
+            await callback.message.answer(
+                "❌ Hozircha bo‘sh slot topilmadi.\n"
+                "Yulduz yechilmadi.",
+                reply_markup=main_menu()
+            )
+
+            await state.clear()
+            await callback.answer()
+            return
+
+        selected_slot = slots[0]
+        time_from = selected_slot.get("timeFrom")
+
+        if not time_from:
+            raise Exception("Slot ichida timeFrom topilmadi.")
+
+        await uzum_set_slot(store_id, invoice_id, time_from)
+
+        save_booking(
+            telegram_id=telegram_id,
+            store_id=store_id,
+            invoice=invoice_text,
+            date=data.get("date"),
+            status="booked",
+            result=f"invoice_id={invoice_id}, timeFrom={time_from}"
+        )
+
+        change_stars(telegram_id, -1)
+
+        await callback.message.answer(
+            "✅ Slot muvaffaqiyatli bron qilindi!\n\n"
+            f"🏪 Do‘kon ID: {store_id}\n"
+            f"📦 Invoice: {invoice_text}\n"
+            f"🆔 Invoice ID: {invoice_id}\n"
+            f"⏰ timeFrom: {time_from}\n\n"
+            "⭐ 1 yulduz yechildi.",
+            reply_markup=main_menu()
+        )
+
+    except Exception as e:
+        save_booking(
+            telegram_id=telegram_id,
+            store_id=store_id,
+            invoice=invoice_text,
+            date=data.get("date"),
+            status="error",
+            result=str(e)
+        )
+
+        await callback.message.answer(
+            "❌ Real bron qilishda xato chiqdi.\n\n"
+            f"Xato: {e}\n\n"
+            "Yulduz yechilmadi.",
+            reply_markup=main_menu()
+        )
 
     await state.clear()
     await callback.answer()
@@ -633,12 +825,13 @@ async def history(callback: CallbackQuery):
     text = "📜 Oxirgi bronlar tarixi:\n\n"
 
     for row in rows:
-        store_id, invoice, date, status, created_at = row
+        store_id, invoice, date, status, result, created_at = row
         text += (
             f"🏪 Do‘kon ID: {store_id}\n"
             f"📦 Invoice: {invoice}\n"
             f"📅 Sana: {date}\n"
             f"Holat: {status}\n"
+            f"Natija: {result or '-'}\n"
             f"Vaqt: {created_at}\n\n"
         )
 
@@ -748,7 +941,7 @@ async def admin_bookings(callback: CallbackQuery):
     text = "📦 Oxirgi bronlar:\n\n"
 
     for row in rows:
-        telegram_id, full_name, store_id, invoice, date, status, created_at = row
+        telegram_id, full_name, store_id, invoice, date, status, result, created_at = row
 
         text += (
             f"User ID: {telegram_id}\n"
@@ -757,6 +950,7 @@ async def admin_bookings(callback: CallbackQuery):
             f"Invoice: {invoice}\n"
             f"Sana: {date}\n"
             f"Holat: {status}\n"
+            f"Natija: {result or '-'}\n"
             f"Vaqt: {created_at}\n\n"
         )
 
