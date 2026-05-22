@@ -4,7 +4,6 @@ import sqlite3
 from datetime import datetime
 
 from dotenv import load_dotenv
-
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery
@@ -17,6 +16,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
+EMPLOYEE_PHONE = os.getenv("EMPLOYEE_PHONE", "+998200276702")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN topilmadi. Railway Variables ichiga BOT_TOKEN qo‘ying.")
@@ -29,10 +29,17 @@ dp = Dispatcher()
 DB_NAME = "bot.db"
 
 
-# ===================== DATABASE =====================
+# ================= DATABASE =================
 
 def db():
     return sqlite3.connect(DB_NAME)
+
+
+def ensure_column(cur, table, column, column_type):
+    cur.execute(f"PRAGMA table_info({table})")
+    columns = [row[1] for row in cur.fetchall()]
+    if column not in columns:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
 
 
 def init_db():
@@ -71,11 +78,20 @@ def init_db():
         )
     """)
 
+    ensure_column(cur, "users", "username", "TEXT")
+    ensure_column(cur, "users", "stars", "INTEGER DEFAULT 1")
+    ensure_column(cur, "users", "is_blocked", "INTEGER DEFAULT 0")
+    ensure_column(cur, "users", "created_at", "TEXT")
+
     conn.commit()
     conn.close()
 
 
-def add_user(telegram_id: int, full_name: str, username: str | None):
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def add_user(telegram_id, full_name, username):
     conn = db()
     cur = conn.cursor()
 
@@ -88,14 +104,7 @@ def add_user(telegram_id: int, full_name: str, username: str | None):
             INSERT INTO users (telegram_id, full_name, username, stars, is_blocked, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (
-                telegram_id,
-                full_name,
-                username or "",
-                1,
-                0,
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            )
+            (telegram_id, full_name, username or "", 1, 0, now())
         )
     else:
         cur.execute(
@@ -107,106 +116,78 @@ def add_user(telegram_id: int, full_name: str, username: str | None):
     conn.close()
 
 
-def is_blocked(telegram_id: int) -> bool:
+def is_blocked(telegram_id):
     conn = db()
     cur = conn.cursor()
-
     cur.execute("SELECT is_blocked FROM users WHERE telegram_id = ?", (telegram_id,))
     row = cur.fetchone()
-
     conn.close()
     return bool(row and row[0] == 1)
 
 
-def set_block_status(telegram_id: int, status: int):
+def set_block_status(telegram_id, status):
     conn = db()
     cur = conn.cursor()
-
-    cur.execute(
-        "UPDATE users SET is_blocked = ? WHERE telegram_id = ?",
-        (status, telegram_id)
-    )
-
+    cur.execute("UPDATE users SET is_blocked = ? WHERE telegram_id = ?", (status, telegram_id))
     conn.commit()
     conn.close()
 
 
-def get_stars(telegram_id: int) -> int:
+def get_stars(telegram_id):
     conn = db()
     cur = conn.cursor()
-
     cur.execute("SELECT stars FROM users WHERE telegram_id = ?", (telegram_id,))
     row = cur.fetchone()
-
     conn.close()
     return row[0] if row else 0
 
 
-def change_stars(telegram_id: int, amount: int):
+def change_stars(telegram_id, amount):
     conn = db()
     cur = conn.cursor()
-
-    cur.execute(
-        "UPDATE users SET stars = stars + ? WHERE telegram_id = ?",
-        (amount, telegram_id)
-    )
-
+    cur.execute("UPDATE users SET stars = stars + ? WHERE telegram_id = ?", (amount, telegram_id))
     conn.commit()
     conn.close()
 
 
-def save_store(telegram_id: int, store_id: str):
+def save_store(telegram_id, store_id):
     conn = db()
     cur = conn.cursor()
-
     cur.execute("DELETE FROM stores WHERE telegram_id = ?", (telegram_id,))
     cur.execute(
         "INSERT INTO stores (telegram_id, store_id, created_at) VALUES (?, ?, ?)",
-        (telegram_id, store_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        (telegram_id, store_id, now())
     )
-
     conn.commit()
     conn.close()
 
 
-def get_store(telegram_id: int):
+def get_store(telegram_id):
     conn = db()
     cur = conn.cursor()
-
     cur.execute("SELECT store_id FROM stores WHERE telegram_id = ?", (telegram_id,))
     row = cur.fetchone()
-
     conn.close()
     return row[0] if row else None
 
 
-def save_booking(telegram_id: int, store_id: str, invoice: str, date: str, status: str):
+def save_booking(telegram_id, store_id, invoice, date, status):
     conn = db()
     cur = conn.cursor()
-
     cur.execute(
         """
         INSERT INTO bookings (telegram_id, store_id, invoice, date, status, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (
-            telegram_id,
-            store_id,
-            invoice,
-            date,
-            status,
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        )
+        (telegram_id, store_id, invoice, date, status, now())
     )
-
     conn.commit()
     conn.close()
 
 
-def get_user_bookings(telegram_id: int):
+def get_user_bookings(telegram_id):
     conn = db()
     cur = conn.cursor()
-
     cur.execute(
         """
         SELECT store_id, invoice, date, status, created_at
@@ -217,7 +198,6 @@ def get_user_bookings(telegram_id: int):
         """,
         (telegram_id,)
     )
-
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -243,10 +223,9 @@ def get_stats():
     return users_count, stores_count, bookings_count, blocked_count
 
 
-def get_all_users(limit: int = 20):
+def get_all_users(limit=20):
     conn = db()
     cur = conn.cursor()
-
     cur.execute(
         """
         SELECT telegram_id, full_name, username, stars, is_blocked, created_at
@@ -256,16 +235,14 @@ def get_all_users(limit: int = 20):
         """,
         (limit,)
     )
-
     rows = cur.fetchall()
     conn.close()
     return rows
 
 
-def get_all_stores(limit: int = 20):
+def get_all_stores(limit=20):
     conn = db()
     cur = conn.cursor()
-
     cur.execute(
         """
         SELECT s.store_id, s.telegram_id, u.full_name, u.username, s.created_at
@@ -276,16 +253,14 @@ def get_all_stores(limit: int = 20):
         """,
         (limit,)
     )
-
     rows = cur.fetchall()
     conn.close()
     return rows
 
 
-def get_all_bookings(limit: int = 20):
+def get_all_bookings(limit=20):
     conn = db()
     cur = conn.cursor()
-
     cur.execute(
         """
         SELECT b.telegram_id, u.full_name, b.store_id, b.invoice, b.date, b.status, b.created_at
@@ -296,7 +271,6 @@ def get_all_bookings(limit: int = 20):
         """,
         (limit,)
     )
-
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -305,15 +279,13 @@ def get_all_bookings(limit: int = 20):
 def get_all_user_ids():
     conn = db()
     cur = conn.cursor()
-
     cur.execute("SELECT telegram_id FROM users WHERE is_blocked = 0")
     rows = cur.fetchall()
-
     conn.close()
     return [row[0] for row in rows]
 
 
-# ===================== STATES =====================
+# ================= STATES =================
 
 class StoreState(StatesGroup):
     waiting_store_id = State()
@@ -333,13 +305,14 @@ class AdminState(StatesGroup):
     waiting_unblock_user_id = State()
 
 
-# ===================== MENUS =====================
+# ================= MENUS =================
 
 def main_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="🏪 Do‘kon ulash", callback_data="connect_store")
     kb.button(text="📦 Yangi bron", callback_data="new_booking")
     kb.button(text="⭐ Balans", callback_data="balance")
+    kb.button(text="💳 Yulduz sotib olish", callback_data="buy_stars")
     kb.button(text="📜 Bronlar tarixi", callback_data="history")
     kb.adjust(1)
     return kb.as_markup()
@@ -376,28 +349,22 @@ def admin_menu():
     return kb.as_markup()
 
 
-# ===================== HELPERS =====================
-
-def admin_check(user_id: int) -> bool:
+def admin_check(user_id):
     return user_id == ADMIN_ID
 
 
-async def blocked_guard(message: Message) -> bool:
+async def blocked_guard(message):
     if is_blocked(message.from_user.id):
         await message.answer("Siz botdan foydalanishdan bloklangansiz.")
         return True
     return False
 
 
-# ===================== USER COMMANDS =====================
+# ================= USER COMMANDS =================
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    add_user(
-        telegram_id=message.from_user.id,
-        full_name=message.from_user.full_name,
-        username=message.from_user.username
-    )
+    add_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
 
     if await blocked_guard(message):
         return
@@ -424,7 +391,7 @@ async def admin(message: Message):
     await message.answer("Admin panel:", reply_markup=admin_menu())
 
 
-# ===================== STORE =====================
+# ================= STORE =================
 
 @dp.callback_query(F.data == "connect_store")
 async def connect_store(callback: CallbackQuery, state: FSMContext):
@@ -437,8 +404,10 @@ async def connect_store(callback: CallbackQuery, state: FSMContext):
         "Do‘koningizni ulash uchun:\n\n"
         "1. Uzum Seller paneliga kiring\n"
         "2. Xodimlar bo‘limiga o‘ting\n"
-        "3. Bot uchun berilgan telefon raqamni xodim sifatida qo‘shing\n"
-        "4. Keyin do‘kon ID raqamini yuboring.\n\n"
+        "3. Quyidagi telefon raqamni xodim sifatida qo‘shing:\n\n"
+        f"{EMPLOYEE_PHONE}\n\n"
+        "4. Rol sifatida “Tovarlarni tayyorlash markazi xodimi” ni tanlang\n"
+        "5. Xodim qo‘shilgandan keyin do‘kon ID raqamini yuboring.\n\n"
         "Do‘kon ID raqamini kiriting:"
     )
 
@@ -470,7 +439,7 @@ async def store_id_save(message: Message, state: FSMContext):
     await state.clear()
 
 
-# ===================== BOOKING =====================
+# ================= BOOKING =================
 
 @dp.callback_query(F.data == "new_booking")
 async def new_booking(callback: CallbackQuery, state: FSMContext):
@@ -483,10 +452,7 @@ async def new_booking(callback: CallbackQuery, state: FSMContext):
     store_id = get_store(telegram_id)
 
     if not store_id:
-        await callback.message.answer(
-            "Avval do‘koningizni ulang.",
-            reply_markup=main_menu()
-        )
+        await callback.message.answer("Avval do‘koningizni ulang.", reply_markup=main_menu())
         await callback.answer()
         return
 
@@ -525,7 +491,6 @@ async def get_invoice(message: Message, state: FSMContext):
         return
 
     await state.update_data(invoice=invoice)
-
     await message.answer("Sanani tanlang:", reply_markup=date_menu())
 
 
@@ -626,7 +591,7 @@ async def cancel_booking(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-# ===================== BALANCE / HISTORY =====================
+# ================= BALANCE / PAYMENT / HISTORY =================
 
 @dp.callback_query(F.data == "balance")
 async def balance(callback: CallbackQuery):
@@ -637,6 +602,22 @@ async def balance(callback: CallbackQuery):
         reply_markup=main_menu()
     )
 
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "buy_stars")
+async def buy_stars(callback: CallbackQuery):
+    await callback.message.answer(
+        "💳 Yulduz sotib olish\n\n"
+        "⭐ Tariflar:\n\n"
+        "10 yulduz — 10 000 so‘m\n"
+        "50 yulduz — 45 000 so‘m\n"
+        "100 yulduz — 80 000 so‘m\n\n"
+        "To‘lov qilganingizdan keyin chekni adminga yuboring.\n\n"
+        f"Sizning Telegram ID: {callback.from_user.id}\n\n"
+        "Admin sizga yulduz qo‘shib beradi.",
+        reply_markup=main_menu()
+    )
     await callback.answer()
 
 
@@ -665,7 +646,7 @@ async def history(callback: CallbackQuery):
     await callback.answer()
 
 
-# ===================== ADMIN PANEL =====================
+# ================= ADMIN PANEL =================
 
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats(callback: CallbackQuery):
@@ -951,14 +932,14 @@ async def admin_unblock_user_id(message: Message, state: FSMContext):
     )
 
     try:
-        await bot.send_message(int(user_id), "✅ Siz botda qayta foydalanishingiz mumkin.")
+        await bot.send_message(int(user_id), "✅ Siz botdan qayta foydalanishingiz mumkin.")
     except Exception:
         pass
 
     await state.clear()
 
 
-# ===================== RUN =====================
+# ================= RUN =================
 
 async def main():
     init_db()
