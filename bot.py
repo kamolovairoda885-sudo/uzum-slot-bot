@@ -150,14 +150,31 @@ def get_stars(telegram_id):
     row = cur.fetchone()
     conn.close()
     return row[0] if row else 0
-
-
 def change_stars(telegram_id, amount):
     conn = db()
     cur = conn.cursor()
-    cur.execute("UPDATE users SET stars = stars + ? WHERE telegram_id = ?", (amount, telegram_id))
+
+    cur.execute("SELECT telegram_id FROM users WHERE telegram_id = ?", (telegram_id,))
+    exists = cur.fetchone()
+
+    if not exists:
+        cur.execute(
+            """
+            INSERT INTO users (telegram_id, full_name, username, stars, is_blocked, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (telegram_id, "", "", amount, 0, now())
+        )
+    else:
+        cur.execute(
+            "UPDATE users SET stars = stars + ? WHERE telegram_id = ?",
+            (amount, telegram_id)
+        )
+
     conn.commit()
     conn.close()
+
+
 
 
 def save_store(telegram_id, store_id):
