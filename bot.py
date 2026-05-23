@@ -377,14 +377,38 @@ async def uzum_find_invoice_id(shop_id: str, invoice_text: str):
 
             return int(record["id"])
 
-async def uzum_get_slots(shop_id: str, invoice_id: int):
+def date_to_timestamp_ms(date_text: str):
+    """
+    28.05.2026 ko‘rinishidagi sanani timestamp millisekundga aylantiradi.
+    Agar Bugun/Ertaga bo‘lsa, hozirgi vaqtni oladi.
+    """
+    try:
+        if date_text and "." in date_text:
+            dt = datetime.strptime(date_text.strip(), "%d.%m.%Y")
+            return int(dt.timestamp() * 1000)
+    except Exception:
+        pass
+
+    return int(time.time() * 1000)
+
+
+async def uzum_get_slots(shop_id: str, invoice_id: int, date_text: str):
     url = f"https://api-seller.uzum.uz/api/seller/shop/{shop_id}/v2/invoice/time-slot/get"
 
     payload = {
         "invoiceIds": [invoice_id],
         "poolSource": UZUM_POOL_SOURCE,
-        "timeFrom": int(time.time() * 1000)
+        "timeFrom": date_to_timestamp_ms(date_text)
     }
+
+    async with aiohttp.ClientSession(headers=uzum_headers()) as session:
+        async with session.post(url, json=payload) as response:
+            data = await response.json(content_type=None)
+
+            if response.status != 200:
+                raise Exception(f"Slot olishda xato: {response.status}. Javob: {str(data)[:500]}")
+
+            return find_timeslots(data)
 
     async with aiohttp.ClientSession(headers=uzum_headers()) as session:
         async with session.post(url, json=payload) as response:
@@ -713,7 +737,7 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext):
     try:
         invoice_id = await uzum_find_invoice_id(store_id, invoice_text)
 
-        slots = await uzum_get_slots(store_id, invoice_id)
+      slots = await uzum_get_slots(store_id, invoice_id, data.get("date"))  
 
         if not slots:
             save_booking(
