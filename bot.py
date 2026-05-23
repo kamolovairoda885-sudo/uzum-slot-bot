@@ -377,7 +377,6 @@ async def uzum_find_invoice_id(shop_id: str, invoice_text: str):
 
             return int(record["id"])
 
-
 async def uzum_get_slots(shop_id: str, invoice_id: int):
     url = f"https://api-seller.uzum.uz/api/seller/shop/{shop_id}/v2/invoice/time-slot/get"
 
@@ -386,6 +385,16 @@ async def uzum_get_slots(shop_id: str, invoice_id: int):
         "poolSource": UZUM_POOL_SOURCE,
         "timeFrom": int(time.time() * 1000)
     }
+
+    async with aiohttp.ClientSession(headers=uzum_headers()) as session:
+        async with session.post(url, json=payload) as response:
+            data = await response.json(content_type=None)
+
+            if response.status != 200:
+                raise Exception(f"Slot olishda xato: {response.status}")
+
+            return find_timeslots(data)
+
 
     async with aiohttp.ClientSession(headers=uzum_headers()) as session:
         async with session.request("GET", url, json=payload) as response:
