@@ -2,7 +2,7 @@ import asyncio
 import os
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import aiohttp
 from dotenv import load_dotenv
@@ -19,7 +19,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
-EMPLOYEE_PHONE = os.getenv("EMPLOYEE_PHONE", "+998 99 622 36 46")
+EMPLOYEE_PHONE = os.getenv("EMPLOYEE_PHONE", "+998 XX XXX XX XX")
 
 UZUM_AUTHORIZATION = os.getenv("UZUM_AUTHORIZATION")
 UZUM_COOKIE = os.getenv("UZUM_COOKIE")
@@ -91,7 +91,6 @@ def init_db():
     ensure_column(cur, "users", "stars", "INTEGER DEFAULT 1")
     ensure_column(cur, "users", "is_blocked", "INTEGER DEFAULT 0")
     ensure_column(cur, "users", "created_at", "TEXT")
-
     ensure_column(cur, "bookings", "result", "TEXT")
 
     conn.commit()
@@ -303,6 +302,8 @@ def uzum_headers():
         "Accept": "application/json",
         "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0",
+        "Origin": "https://seller.uzum.uz",
+        "Referer": "https://seller.uzum.uz/",
     }
 
     if UZUM_AUTHORIZATION:
@@ -312,6 +313,21 @@ def uzum_headers():
         headers["Cookie"] = UZUM_COOKIE
 
     return headers
+
+
+async def read_response(response):
+    try:
+        return await response.json(content_type=None)
+    except Exception:
+        text = await response.text()
+        return {"raw": text[:1000]}
+
+
+def short_data(data, limit=500):
+    text = str(data)
+    if len(text) > limit:
+        return text[:limit] + "..."
+    return text
 
 
 def find_invoice_record(obj, invoice_number):
@@ -352,6 +368,30 @@ def find_timeslots(obj):
     return []
 
 
+def date_to_timestamp_ms(date_text: str):
+    """
+    Bugun / Ertaga / 28.05.2026 ko‘rinishlarini timestamp millisekundga aylantiradi.
+    """
+    if not date_text:
+        return int(time.time() * 1000)
+
+    value = date_text.strip().lower()
+
+    if value == "bugun":
+        dt = datetime.now()
+        return int(dt.timestamp() * 1000)
+
+    if value == "ertaga":
+        dt = datetime.now() + timedelta(days=1)
+        return int(dt.timestamp() * 1000)
+
+    try:
+        dt = datetime.strptime(date_text.strip(), "%d.%m.%Y")
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return int(time.time() * 1000)
+
+
 async def uzum_find_invoice_id(shop_id: str, invoice_text: str):
     invoice_text = invoice_text.strip()
 
@@ -365,31 +405,21 @@ async def uzum_find_invoice_id(shop_id: str, invoice_text: str):
 
     async with aiohttp.ClientSession(headers=uzum_headers()) as session:
         async with session.get(url) as response:
-            data = await response.json(content_type=None)
+            data = await read_response(response)
 
             if response.status != 200:
-                raise Exception(f"Invoice qidirishda xato: {response.status}")
+                raise Exception(
+                    f"Invoice qidirishda xato: {response.status}. Javob: {short_data(data)}"
+                )
 
             record = find_invoice_record(data, invoice_text)
 
             if not record:
-                raise Exception("Invoice topilmadi.")
+                raise Exception(
+                    f"Invoice topilmadi. Qidirilgan: {invoice_text}. Javob: {short_data(data)}"
+                )
 
             return int(record["id"])
-
-def date_to_timestamp_ms(date_text: str):
-    """
-    28.05.2026 ko‘rinishidagi sanani timestamp millisekundga aylantiradi.
-    Agar Bugun/Ertaga bo‘lsa, hozirgi vaqtni oladi.
-    """
-    try:
-        if date_text and "." in date_text:
-            dt = datetime.strptime(date_text.strip(), "%d.%m.%Y")
-            return int(dt.timestamp() * 1000)
-    except Exception:
-        pass
-
-    return int(time.time() * 1000)
 
 
 async def uzum_get_slots(shop_id: str, invoice_id: int, date_text: str):
@@ -403,29 +433,12 @@ async def uzum_get_slots(shop_id: str, invoice_id: int, date_text: str):
 
     async with aiohttp.ClientSession(headers=uzum_headers()) as session:
         async with session.post(url, json=payload) as response:
-            data = await response.json(content_type=None)
+            data = await read_response(response)
 
             if response.status != 200:
-                raise Exception(f"Slot olishda xato: {response.status}. Javob: {str(data)[:500]}")
-
-            return find_timeslots(data)
-
-    async with aiohttp.ClientSession(headers=uzum_headers()) as session:
-        async with session.post(url, json=payload) as response:
-            data = await response.json(content_type=None)
-
-            if response.status != 200:
-                raise Exception(f"Slot olishda xato: {response.status}")
-
-            return find_timeslots(data)
-
-
-    async with aiohttp.ClientSession(headers=uzum_headers()) as session:
-        async with session.request("GET", url, json=payload) as response:
-            data = await response.json(content_type=None)
-
-            if response.status != 200:
-                raise Exception(f"Slot olishda xato: {response.status}")
+                raise Exception(
+                    f"Slot olishda xato: {response.status}. Javob: {short_data(data)}"
+                )
 
             return find_timeslots(data)
 
@@ -442,10 +455,12 @@ async def uzum_set_slot(shop_id: str, invoice_id: int, time_from: int):
 
     async with aiohttp.ClientSession(headers=uzum_headers()) as session:
         async with session.post(url, json=payload) as response:
-            data = await response.json(content_type=None)
+            data = await read_response(response)
 
             if response.status != 200:
-                raise Exception(f"Slot saqlashda xato: {response.status}")
+                raise Exception(
+                    f"Slot saqlashda xato: {response.status}. Javob: {short_data(data)}"
+                )
 
             return data
 
@@ -722,6 +737,7 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext):
     store_id = get_store(telegram_id)
     stars = get_stars(telegram_id)
     invoice_text = data.get("invoice")
+    selected_date = data.get("date")
 
     if stars <= 0:
         await callback.message.answer("Balansingizda yulduz yo‘q.")
@@ -736,15 +752,14 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext):
 
     try:
         invoice_id = await uzum_find_invoice_id(store_id, invoice_text)
-
-      slots = await uzum_get_slots(store_id, invoice_id, data.get("date"))  
+        slots = await uzum_get_slots(store_id, invoice_id, selected_date)
 
         if not slots:
             save_booking(
                 telegram_id=telegram_id,
                 store_id=store_id,
                 invoice=invoice_text,
-                date=data.get("date"),
+                date=selected_date,
                 status="no_slots",
                 result="Bo‘sh slot topilmadi"
             )
@@ -763,7 +778,7 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext):
         time_from = selected_slot.get("timeFrom")
 
         if not time_from:
-            raise Exception("Slot ichida timeFrom topilmadi.")
+            raise Exception(f"Slot ichida timeFrom topilmadi. Slot: {selected_slot}")
 
         await uzum_set_slot(store_id, invoice_id, time_from)
 
@@ -771,7 +786,7 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext):
             telegram_id=telegram_id,
             store_id=store_id,
             invoice=invoice_text,
-            date=data.get("date"),
+            date=selected_date,
             status="booked",
             result=f"invoice_id={invoice_id}, timeFrom={time_from}"
         )
@@ -793,7 +808,7 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext):
             telegram_id=telegram_id,
             store_id=store_id,
             invoice=invoice_text,
-            date=data.get("date"),
+            date=selected_date,
             status="error",
             result=str(e)
         )
