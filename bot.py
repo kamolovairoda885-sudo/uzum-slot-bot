@@ -446,7 +446,7 @@ async def auto_search_slot(telegram_id: int, store_id: str, invoice_id: int, inv
         except Exception as e:
             pass
 
-        await asyncio.sleep(5)
+        await asyncio.sleep(1)
 
     # 3 soat tugadi
     active_searches.pop(telegram_id, None)
