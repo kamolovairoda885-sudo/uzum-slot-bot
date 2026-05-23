@@ -1,15 +1,22 @@
 import asyncio
 import os
+import re
 import sqlite3
 import time
-from datetime import datetime, timedelta
+import uuid
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -23,8 +30,14 @@ EMPLOYEE_PHONE = os.getenv("EMPLOYEE_PHONE", "+998 XX XXX XX XX")
 
 UZUM_AUTHORIZATION = os.getenv("UZUM_AUTHORIZATION")
 UZUM_COOKIE = os.getenv("UZUM_COOKIE")
-UZUM_POOL_SOURCE = os.getenv("UZUM_POOL_SOURCE", "FULFILLMENT")
+UZUM_POOL_SOURCE = os.getenv("UZUM_POOL_SOURCE", "FULLFILMENT")
 UZUM_STOCK_ID = int(os.getenv("UZUM_STOCK_ID", "34"))
+
+SEARCH_INTERVAL = int(os.getenv("SEARCH_INTERVAL", "3"))
+SEARCH_HOURS = int(os.getenv("SEARCH_HOURS", "3"))
+
+PAYMENT_CARD = os.getenv("PAYMENT_CARD", "0000 0000 0000 0000")
+PAYMENT_OWNER = os.getenv("PAYMENT_OWNER", "Ism Familiya")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN topilmadi.")
@@ -35,9 +48,16 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 DB_NAME = "bot.db"
+UZ_TZ = timezone(timedelta(hours=5))
 
-# Faol qidiruvlar: {telegram_id: {store_id, invoice_id, invoice_text, date}}
 active_searches = {}
+pending_payments = {}
+
+STAR_PLANS = {
+    "1": {"stars": 1, "price": 25000},
+    "2": {"stars": 2, "price": 45000},
+    "5": {"stars": 5, "price": 100000},
+}
 
 
 # ================= DATABASE =================
@@ -73,6 +93,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             telegram_id INTEGER,
             store_id TEXT,
+            store_name TEXT,
             created_at TEXT
         )
     """)
@@ -82,6 +103,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             telegram_id INTEGER,
             store_id TEXT,
+            store_name TEXT,
             invoice TEXT,
             date TEXT,
             status TEXT,
@@ -94,6 +116,10 @@ def init_db():
     ensure_column(cur, "users", "stars", "INTEGER DEFAULT 1")
     ensure_column(cur, "users", "is_blocked", "INTEGER DEFAULT 0")
     ensure_column(cur, "users", "created_at", "TEXT")
+
+    ensure_column(cur, "stores", "store_name", "TEXT")
+
+    ensure_column(cur, "bookings", "store_name", "TEXT")
     ensure_column(cur, "bookings", "result", "TEXT")
 
     conn.commit()
@@ -101,7 +127,7 @@ def init_db():
 
 
 def now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(UZ_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def add_user(telegram_id, full_name="", username=""):
@@ -180,36 +206,108 @@ def change_stars(telegram_id, amount):
     conn.close()
 
 
-def save_store(telegram_id, store_id):
+def store_used_by_other_user(store_id, telegram_id):
     conn = db()
     cur = conn.cursor()
-    cur.execute("DELETE FROM stores WHERE telegram_id = ?", (telegram_id,))
+
     cur.execute(
-        "INSERT INTO stores (telegram_id, store_id, created_at) VALUES (?, ?, ?)",
-        (telegram_id, store_id, now())
+        """
+        SELECT telegram_id
+        FROM stores
+        WHERE store_id = ? AND telegram_id != ?
+        LIMIT 1
+        """,
+        (store_id, telegram_id)
     )
+
+    row = cur.fetchone()
+    conn.close()
+
+    return row[0] if row else None
+
+
+def save_store(telegram_id, store_id, store_name):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT id FROM stores WHERE telegram_id = ? AND store_id = ?",
+        (telegram_id, store_id)
+    )
+    exists = cur.fetchone()
+
+    if exists:
+        cur.execute(
+            "UPDATE stores SET store_name = ? WHERE telegram_id = ? AND store_id = ?",
+            (store_name, telegram_id, store_id)
+        )
+    else:
+        cur.execute(
+            """
+            INSERT INTO stores (telegram_id, store_id, store_name, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (telegram_id, store_id, store_name, now())
+        )
+
     conn.commit()
     conn.close()
 
 
-def get_store(telegram_id):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT store_id FROM stores WHERE telegram_id = ?", (telegram_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-
-def save_booking(telegram_id, store_id, invoice, date, status, result=""):
+def get_user_stores(telegram_id):
     conn = db()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO bookings (telegram_id, store_id, invoice, date, status, result, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        SELECT id, store_id, store_name, created_at
+        FROM stores
+        WHERE telegram_id = ?
+        ORDER BY id DESC
         """,
-        (telegram_id, store_id, invoice, date, status, result, now())
+        (telegram_id,)
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_store_by_id(row_id, telegram_id=None):
+    conn = db()
+    cur = conn.cursor()
+
+    if telegram_id is None:
+        cur.execute(
+            "SELECT id, telegram_id, store_id, store_name FROM stores WHERE id = ?",
+            (row_id,)
+        )
+    else:
+        cur.execute(
+            "SELECT id, telegram_id, store_id, store_name FROM stores WHERE id = ? AND telegram_id = ?",
+            (row_id, telegram_id)
+        )
+
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def delete_store(row_id, telegram_id):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM stores WHERE id = ? AND telegram_id = ?", (row_id, telegram_id))
+    conn.commit()
+    conn.close()
+
+
+def save_booking(telegram_id, store_id, store_name, invoice, date, status, result=""):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO bookings (telegram_id, store_id, store_name, invoice, date, status, result, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (telegram_id, store_id, store_name, invoice, date, status, result, now())
     )
     conn.commit()
     conn.close()
@@ -220,7 +318,7 @@ def get_user_bookings(telegram_id):
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT store_id, invoice, date, status, result, created_at
+        SELECT store_name, store_id, invoice, date, status, result, created_at
         FROM bookings
         WHERE telegram_id = ?
         ORDER BY id DESC
@@ -270,12 +368,12 @@ def get_all_users(limit=20):
     return rows
 
 
-def get_all_stores(limit=20):
+def get_all_stores(limit=30):
     conn = db()
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT s.store_id, s.telegram_id, u.full_name, u.username, s.created_at
+        SELECT s.store_id, s.store_name, s.telegram_id, u.full_name, u.username, s.created_at
         FROM stores s
         LEFT JOIN users u ON s.telegram_id = u.telegram_id
         ORDER BY s.id DESC
@@ -288,12 +386,12 @@ def get_all_stores(limit=20):
     return rows
 
 
-def get_all_bookings(limit=20):
+def get_all_bookings(limit=30):
     conn = db()
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT b.telegram_id, u.full_name, b.store_id, b.invoice, b.date, b.status, b.result, b.created_at
+        SELECT b.telegram_id, u.full_name, b.store_name, b.store_id, b.invoice, b.date, b.status, b.result, b.created_at
         FROM bookings b
         LEFT JOIN users u ON b.telegram_id = u.telegram_id
         ORDER BY b.id DESC
@@ -345,9 +443,82 @@ async def read_response(response):
 
 def short_data(data, limit=500):
     text = str(data)
-    if len(text) > limit:
-        return text[:limit] + "..."
-    return text
+    return text[:limit] + "..." if len(text) > limit else text
+
+
+def find_key_recursive(obj, keys):
+    if isinstance(obj, dict):
+        for key in keys:
+            if key in obj and obj[key]:
+                return obj[key]
+
+        for value in obj.values():
+            result = find_key_recursive(value, keys)
+            if result:
+                return result
+
+    if isinstance(obj, list):
+        for item in obj:
+            result = find_key_recursive(item, keys)
+            if result:
+                return result
+
+    return None
+
+
+def find_shop_name_by_id(obj, shop_id):
+    if isinstance(obj, dict):
+        possible_id = obj.get("id") or obj.get("shopId") or obj.get("shop_id")
+
+        if str(possible_id) == str(shop_id):
+            name = find_key_recursive(obj, ["name", "shopName", "title", "storeName", "sellerName"])
+            if name:
+                return str(name)
+
+        for value in obj.values():
+            result = find_shop_name_by_id(value, shop_id)
+            if result:
+                return result
+
+    if isinstance(obj, list):
+        for item in obj:
+            result = find_shop_name_by_id(item, shop_id)
+            if result:
+                return result
+
+    return None
+
+
+async def uzum_get_shop_name(shop_id: str):
+    urls = [
+        f"https://api-seller.uzum.uz/api/seller/shop/{shop_id}",
+        f"https://api-seller.uzum.uz/api/seller/shop",
+    ]
+
+    async with aiohttp.ClientSession(headers=uzum_headers()) as session:
+        for url in urls:
+            try:
+                async with session.get(url) as response:
+                    data = await read_response(response)
+
+                    if response.status != 200:
+                        continue
+
+                    exact_name = find_shop_name_by_id(data, shop_id)
+                    if exact_name:
+                        return exact_name
+
+                    name = find_key_recursive(
+                        data,
+                        ["name", "shopName", "title", "storeName", "sellerName"]
+                    )
+                    if name:
+                        return str(name)
+
+            except Exception:
+                continue
+
+    return f"Do‘kon {shop_id}"
 
 
 def find_invoice_record(obj, invoice_number):
@@ -388,62 +559,50 @@ def find_timeslots(obj):
     return []
 
 
-def date_to_timestamp_ms(date_text: str):
-    """
-    Bugun / Ertaga / 28.05.2026 ni timestamp millisekundga aylantiradi.
-    """
-    if not date_text:
-        return int(time.time() * 1000)
-
-    value = date_text.strip().lower()
-
-    if value == "bugun":
-        dt = datetime.now()
-        return int(dt.timestamp() * 1000)
-
-    if value == "ertaga":
-        dt = datetime.now() + timedelta(days=1)
-        return int(dt.timestamp() * 1000)
-
-    try:
-        dt = datetime.strptime(date_text.strip(), "%d.%m.%Y")
-        return int(dt.timestamp() * 1000)
-    except Exception:
-        return int(time.time() * 1000)
+def uz_now():
+    return datetime.now(UZ_TZ)
 
 
 def normalize_date_text(date_text: str):
-    """
-    Tanlangan sanani dd.mm.YYYY formatga keltiradi.
-    """
     value = (date_text or "").strip().lower()
 
-    now_uz = datetime.utcnow() + timedelta(hours=5)
-
     if value == "bugun":
-        return now_uz.strftime("%d.%m.%Y")
+        return uz_now().strftime("%d.%m.%Y")
 
     if value == "ertaga":
-        return (now_uz + timedelta(days=1)).strftime("%d.%m.%Y")
+        return (uz_now() + timedelta(days=1)).strftime("%d.%m.%Y")
 
     try:
         dt = datetime.strptime(date_text.strip(), "%d.%m.%Y")
         return dt.strftime("%d.%m.%Y")
     except Exception:
-        return now_uz.strftime("%d.%m.%Y")
+        return uz_now().strftime("%d.%m.%Y")
+
+
+def date_to_timestamp_ms(date_text: str):
+    wanted = normalize_date_text(date_text)
+
+    try:
+        dt = datetime.strptime(wanted, "%d.%m.%Y")
+        dt = dt.replace(tzinfo=UZ_TZ)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return int(time.time() * 1000)
 
 
 def slot_date_text(time_from):
-    """
-    Uzum qaytargan timeFrom ni dd.mm.YYYY formatga aylantiradi.
-    """
     ts = int(time_from)
 
     if ts < 10_000_000_000:
         ts *= 1000
 
-    dt_uz = datetime.utcfromtimestamp(ts / 1000) + timedelta(hours=5)
-    return dt_uz.strftime("%d.%m.%Y")
+    dt = datetime.fromtimestamp(ts / 1000, UZ_TZ)
+    return dt.strftime("%d.%m.%Y")
+
+
+def parse_invoice_list(text: str):
+    parts = re.split(r"[,\n\s]+", text.strip())
+    return [p.strip() for p in parts if p.strip()]
 
 
 async def uzum_find_invoice_id(shop_id: str, invoice_text: str):
@@ -451,6 +610,9 @@ async def uzum_find_invoice_id(shop_id: str, invoice_text: str):
 
     if invoice_text.isdigit() and len(invoice_text) <= 8:
         return int(invoice_text)
+
+    if invoice_text.isdigit() and invoice_text.startswith("11000") and len(invoice_text) >= 12:
+        return int(invoice_text[5:])
 
     url = (
         f"https://api-seller.uzum.uz/api/seller/shop/{shop_id}/invoice"
@@ -489,6 +651,12 @@ async def uzum_get_slots(shop_id: str, invoice_id: int, date_text: str):
         async with session.post(url, json=payload) as response:
             data = await read_response(response)
 
+            if response.status == 400:
+                return []
+
+            if response.status == 403:
+                raise Exception(f"Ruxsat yo‘q: {short_data(data)}")
+
             if response.status != 200:
                 return []
 
@@ -517,138 +685,30 @@ async def uzum_set_slot(shop_id: str, invoice_id: int, time_from: int):
             return data
 
 
-# ================= AUTO SEARCH =================
-
-async def auto_search_slot(telegram_id: int, store_id: str, invoice_id: int, invoice_text: str, date_text: str):
-    deadline = time.time() + 3 * 60 * 60
-    interval = 1
-
-    await bot.send_message(
-        telegram_id,
-        f"🔍 Qidiruv boshlandi!\n\n"
-        f"🏪 Do‘kon ID: {store_id}\n"
-        f"📦 Invoice: {invoice_text}\n"
-        f"📅 Sana: {date_text}\n\n"
-        f"⏱ Har {interval} sekundda tekshiriladi.\n"
-        f"3 soat ichida slot topilmasa to‘xtatiladi."
-    )
-
-    wanted_date = normalize_date_text(date_text)
-
-    while time.time() < deadline:
-        if telegram_id not in active_searches:
-            return
-
-        try:
-            slots = await uzum_get_slots(store_id, invoice_id, date_text)
-
-            if slots:
-                matched_slots = [
-                    slot for slot in slots
-                    if slot.get("timeFrom") and slot_date_text(slot.get("timeFrom")) == wanted_date
-                ]
-
-                if not matched_slots:
-                    await asyncio.sleep(interval)
-                    continue
-
-                selected_slot = matched_slots[0]
-                time_from = selected_slot.get("timeFrom")
-
-                if time_from:
-                    await uzum_set_slot(store_id, invoice_id, time_from)
-
-                    save_booking(
-                        telegram_id=telegram_id,
-                        store_id=store_id,
-                        invoice=invoice_text,
-                        date=date_text,
-                        status="booked",
-                        result=f"invoice_id={invoice_id}, timeFrom={time_from}, slot_date={wanted_date}"
-                    )
-
-                    change_stars(telegram_id, -1)
-                    active_searches.pop(telegram_id, None)
-
-                    await bot.send_message(
-                        telegram_id,
-                        f"✅ Slot muvaffaqiyatli bron qilindi!\n\n"
-                        f"🏪 Do‘kon ID: {store_id}\n"
-                        f"📦 Invoice: {invoice_text}\n"
-                        f"📅 Siz tanlagan sana: {date_text}\n"
-                        f"📅 Bron qilingan sana: {slot_date_text(time_from)}\n"
-                        f"⏰ timeFrom: {time_from}\n\n"
-                        f"⭐ 1 yulduz yechildi.",
-                        reply_markup=main_menu()
-                    )
-                    return
-
-        except Exception:
-            pass
-
-        await asyncio.sleep(interval)
-
-    active_searches.pop(telegram_id, None)
-
-    await bot.send_message(
-        telegram_id,
-        f"⏰ 3 soat tugadi — siz tanlagan sanaga slot topilmadi.\n\n"
-        f"📦 Invoice: {invoice_text}\n"
-        f"📅 Sana: {date_text}\n\n"
-        f"Yulduz yechilmadi.",
-        reply_markup=main_menu()
-    )
-
-
-# ================= STATES =================
-
-class StoreState(StatesGroup):
-    waiting_store_id = State()
-
-
-class BookingState(StatesGroup):
-    waiting_invoice = State()
-    waiting_custom_date = State()
-    confirming = State()
-
-
-class AdminState(StatesGroup):
-    waiting_user_id_for_stars = State()
-    waiting_star_amount = State()
-    waiting_broadcast_text = State()
-    waiting_block_user_id = State()
-    waiting_unblock_user_id = State()
-
-
 # ================= MENUS =================
 
 def main_menu():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🏪 Do‘kon ulash", callback_data="connect_store")
-    kb.button(text="📦 Yangi bron", callback_data="new_booking")
-    kb.button(text="⭐ Balans", callback_data="balance")
-    kb.button(text="💳 Yulduz sotib olish", callback_data="buy_stars")
-    kb.button(text="📜 Bronlar tarixi", callback_data="history")
-    kb.button(text="🛑 Qidiruvni to‘xtatish", callback_data="stop_search")
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-def date_menu():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Bugun", callback_data="date_today")
-    kb.button(text="Ertaga", callback_data="date_tomorrow")
-    kb.button(text="Boshqa sana", callback_data="date_custom")
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-def confirm_menu():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Tasdiqlash", callback_data="confirm_booking")
-    kb.button(text="❌ Bekor qilish", callback_data="cancel_booking")
-    kb.adjust(1)
-    return kb.as_markup()
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="📦 Yangi bron"),
+                KeyboardButton(text="🏬 Mening do‘konlarim"),
+            ],
+            [
+                KeyboardButton(text="➕ Do‘kon qo‘shish"),
+                KeyboardButton(text="🔍 Faol qidiruvlar"),
+            ],
+            [
+                KeyboardButton(text="🛑 Qidiruvni to‘xtatish"),
+                KeyboardButton(text="⭐ Balans"),
+            ],
+            [
+                KeyboardButton(text="⭐ Yulduz sotib olish"),
+                KeyboardButton(text="📜 Bronlar tarixi"),
+            ],
+        ],
+        resize_keyboard=True
+    )
 
 
 def admin_menu():
@@ -657,11 +717,82 @@ def admin_menu():
     kb.button(text="👥 Userlar", callback_data="admin_users")
     kb.button(text="🏪 Do‘konlar", callback_data="admin_stores")
     kb.button(text="📦 Bronlar", callback_data="admin_bookings")
+    kb.button(text="🔍 Faol qidiruvlar", callback_data="admin_active")
     kb.button(text="⭐ Userga yulduz qo‘shish", callback_data="admin_add_stars")
     kb.button(text="📢 Hammaga xabar yuborish", callback_data="admin_broadcast")
     kb.button(text="🚫 User bloklash", callback_data="admin_block_user")
     kb.button(text="✅ Blokdan chiqarish", callback_data="admin_unblock_user")
     kb.adjust(1)
+    return kb.as_markup()
+
+
+def store_select_keyboard(stores):
+    kb = InlineKeyboardBuilder()
+    for row_id, store_id, store_name, _ in stores:
+        kb.button(text=f"🏪 {store_name}", callback_data=f"select_store:{row_id}")
+    kb.button(text="❌ Bekor qilish", callback_data="cancel_booking")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def stores_list_keyboard(stores):
+    kb = InlineKeyboardBuilder()
+    for row_id, store_id, store_name, _ in stores:
+        kb.button(text=f"❌ O‘chirish: {store_name}", callback_data=f"delete_store:{row_id}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def dates_keyboard(selected_dates=None):
+    selected_dates = selected_dates or []
+    kb = InlineKeyboardBuilder()
+
+    today = uz_now().date()
+
+    for i in range(14):
+        d = today + timedelta(days=i)
+        text = d.strftime("%d.%m.%Y")
+        label = f"✅ {text}" if text in selected_dates else text
+        kb.button(text=label, callback_data=f"date_toggle:{text}")
+
+    kb.button(text="✅ Tayyor", callback_data="dates_done")
+    kb.button(text="❌ Bekor qilish", callback_data="cancel_booking")
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+def confirm_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Tasdiqlash", callback_data="confirm_booking")
+    kb.button(text="❌ Bekor qilish", callback_data="cancel_booking")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def search_stop_keyboard(searches):
+    kb = InlineKeyboardBuilder()
+    for search_id, item in searches.items():
+        text = f"🛑 {item['store_name']} | {item['invoice_text']} | {', '.join(item['dates'])}"
+        kb.button(text=text[:60], callback_data=f"stop_one:{search_id}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def star_plans_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⭐ 1 yulduz — 25 000 so‘m", callback_data="buy_plan:1")
+    kb.button(text="⭐ 2 yulduz — 45 000 so‘m", callback_data="buy_plan:2")
+    kb.button(text="⭐ 5 yulduz — 100 000 so‘m", callback_data="buy_plan:5")
+    kb.button(text="❌ Bekor qilish", callback_data="cancel_payment")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def admin_payment_keyboard(payment_id):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Tasdiqlash", callback_data=f"pay_ok:{payment_id}")
+    kb.button(text="❌ Rad etish", callback_data=f"pay_no:{payment_id}")
+    kb.adjust(2)
     return kb.as_markup()
 
 
@@ -676,7 +807,191 @@ async def blocked_guard(message):
     return False
 
 
-# ================= USER COMMANDS =================
+# ================= STATES =================
+
+class StoreState(StatesGroup):
+    waiting_store_id = State()
+
+
+class BookingState(StatesGroup):
+    choosing_store = State()
+    waiting_invoice = State()
+    choosing_dates = State()
+    confirming = State()
+
+
+class PaymentState(StatesGroup):
+    waiting_receipt = State()
+
+
+class AdminState(StatesGroup):
+    waiting_user_id_for_stars = State()
+    waiting_star_amount = State()
+    waiting_broadcast_text = State()
+    waiting_block_user_id = State()
+    waiting_unblock_user_id = State()
+
+
+# ================= SEARCH WORKER =================
+
+async def auto_search_slot(search_id: str):
+    item = active_searches.get(search_id)
+    if not item:
+        return
+
+    telegram_id = item["telegram_id"]
+    store_id = item["store_id"]
+    store_name = item["store_name"]
+    invoice_id = item["invoice_id"]
+    invoice_text = item["invoice_text"]
+    dates = item["dates"]
+
+    deadline = time.time() + SEARCH_HOURS * 60 * 60
+
+    await bot.send_message(
+        telegram_id,
+        f"🔍 Qidiruv boshlandi!\n\n"
+        f"🏪 Do‘kon: {store_name}\n"
+        f"📦 Invoice: {invoice_text}\n"
+        f"📅 Sanalar: {', '.join(dates)}\n\n"
+        f"⏱ Har {SEARCH_INTERVAL} sekundda tekshiriladi.\n"
+        f"⏳ {SEARCH_HOURS} soat ichida slot topilmasa to‘xtatiladi.",
+        reply_markup=main_menu()
+    )
+
+    while time.time() < deadline:
+        if search_id not in active_searches:
+            return
+
+        if get_stars(telegram_id) <= 0:
+            save_booking(
+                telegram_id, store_id, store_name, invoice_text,
+                ", ".join(dates), "stopped_no_stars", "Balansda yulduz qolmadi"
+            )
+            active_searches.pop(search_id, None)
+
+            await bot.send_message(
+                telegram_id,
+                f"❌ Qidiruv to‘xtadi.\n\n"
+                f"📦 Invoice: {invoice_text}\n"
+                f"Sabab: balansda yulduz qolmadi.",
+                reply_markup=main_menu()
+            )
+            return
+
+        try:
+            for date_text in dates:
+                if search_id not in active_searches:
+                    return
+
+                wanted_date = normalize_date_text(date_text)
+                slots = await uzum_get_slots(store_id, invoice_id, date_text)
+
+                matched_slots = [
+                    slot for slot in slots
+                    if slot.get("timeFrom") and slot_date_text(slot.get("timeFrom")) == wanted_date
+                ]
+
+                if not matched_slots:
+                    continue
+
+                for selected_slot in matched_slots:
+                    time_from = selected_slot.get("timeFrom")
+                    if not time_from:
+                        continue
+
+                    try:
+                        await uzum_set_slot(store_id, invoice_id, time_from)
+
+                        change_stars(telegram_id, -1)
+
+                        save_booking(
+                            telegram_id,
+                            store_id,
+                            store_name,
+                            invoice_text,
+                            wanted_date,
+                            "booked",
+                            f"invoice_id={invoice_id}, timeFrom={time_from}, search_id={search_id}"
+                        )
+
+                        active_searches.pop(search_id, None)
+
+                        await bot.send_message(
+                            telegram_id,
+                            f"✅ Slot muvaffaqiyatli bron qilindi!\n\n"
+                            f"🏪 Do‘kon: {store_name}\n"
+                            f"📦 Invoice: {invoice_text}\n"
+                            f"📅 Bron qilingan sana: {wanted_date}\n"
+                            f"⏰ timeFrom: {time_from}\n\n"
+                            f"⭐ 1 yulduz yechildi.",
+                            reply_markup=main_menu()
+                        )
+                        return
+
+                    except Exception:
+                        continue
+
+        except Exception as e:
+            save_booking(
+                telegram_id,
+                store_id,
+                store_name,
+                invoice_text,
+                ", ".join(dates),
+                "error",
+                str(e)
+            )
+            active_searches.pop(search_id, None)
+
+            await bot.send_message(
+                telegram_id,
+                f"❌ Qidiruvda xato chiqdi.\n\n"
+                f"📦 Invoice: {invoice_text}\n"
+                f"Xato: {e}\n\n"
+                f"Yulduz yechilmadi.",
+                reply_markup=main_menu()
+            )
+            return
+
+        await asyncio.sleep(SEARCH_INTERVAL)
+
+    active_searches.pop(search_id, None)
+
+    save_booking(
+        telegram_id,
+        store_id,
+        store_name,
+        invoice_text,
+        ", ".join(dates),
+        "timeout",
+        f"{SEARCH_HOURS} soat ichida slot topilmadi"
+    )
+
+    await bot.send_message(
+        telegram_id,
+        f"⏰ Vaqt tugadi.\n\n"
+        f"{SEARCH_HOURS} soat ichida siz tanlagan sanalarga slot topilmadi.\n\n"
+        f"🏪 Do‘kon: {store_name}\n"
+        f"📦 Invoice: {invoice_text}\n"
+        f"📅 Sanalar: {', '.join(dates)}\n\n"
+        f"Yulduz yechilmadi.",
+        reply_markup=main_menu()
+    )
+
+
+# ================= START =================
+
+START_TEXT = (
+    "📦 Uzum Time Slot Bot\n\n"
+    "Uzum Market omboriga avtomatik slot bron qilish boti.\n\n"
+    "✅ Bir nechta do‘kon ulash\n"
+    "✅ Bir nechta invoice bo‘yicha qidirish\n"
+    "✅ Tanlangan sana bo‘yicha slot qidirish\n"
+    "✅ Slot topilsa avtomatik bron qilish\n\n"
+    "⚠️ Bot javob bermasa /start ni bosing."
+)
+
 
 @dp.message(CommandStart())
 async def start(message: Message):
@@ -685,12 +1000,7 @@ async def start(message: Message):
     if await blocked_guard(message):
         return
 
-    await message.answer(
-        "Assalomu alaykum!\n\n"
-        "Uzum Time Slot botiga xush kelibsiz ✅\n\n"
-        "Quyidagi menyudan foydalaning:",
-        reply_markup=main_menu()
-    )
+    await message.answer(START_TEXT, reply_markup=main_menu())
 
 
 @dp.message(Command("myid"))
@@ -708,42 +1018,22 @@ async def admin(message: Message):
     await message.answer("Admin panel:", reply_markup=admin_menu())
 
 
-# ================= STOP SEARCH =================
+# ================= USER MENU =================
 
-@dp.callback_query(F.data == "stop_search")
-async def stop_search(callback: CallbackQuery):
-    telegram_id = callback.from_user.id
-
-    if telegram_id in active_searches:
-        active_searches.pop(telegram_id, None)
-        await callback.message.answer("🛑 Qidiruv to‘xtatildi.", reply_markup=main_menu())
-    else:
-        await callback.message.answer("Faol qidiruv yo‘q.", reply_markup=main_menu())
-
-    await callback.answer()
-
-
-# ================= STORE =================
-
-@dp.callback_query(F.data == "connect_store")
-async def connect_store(callback: CallbackQuery, state: FSMContext):
-    if is_blocked(callback.from_user.id):
-        await callback.message.answer("Siz botdan foydalanishdan bloklangansiz.")
-        await callback.answer()
+@dp.message(F.text == "➕ Do‘kon qo‘shish")
+async def add_store_start(message: Message, state: FSMContext):
+    if await blocked_guard(message):
         return
 
-    await callback.message.answer(
-        "Do‘koningizni ulash uchun:\n\n"
+    await message.answer(
+        "🏪 Do‘konni bog‘lash uchun:\n\n"
         "1. Uzum Seller paneliga kiring\n"
-        "2. Xodimlar bo‘limiga o‘ting\n"
+        "2. Sozlamalar → Xodimlar bo‘limiga o‘ting\n"
         "3. Quyidagi telefon raqamni xodim sifatida qo‘shing:\n\n"
-        f"{EMPLOYEE_PHONE}\n\n"
-        "4. Rol sifatida “Tovarlarni tayyorlash markazi xodimi” ni tanlang\n"
-        "5. Do‘kon ID raqamini yuboring."
+        f"📞 {EMPLOYEE_PHONE}\n\n"
+        "Qo‘shgandan so‘ng, do‘kon ID raqamini yuboring."
     )
-
     await state.set_state(StoreState.waiting_store_id)
-    await callback.answer()
 
 
 @dp.message(StoreState.waiting_store_id)
@@ -758,239 +1048,78 @@ async def store_id_save(message: Message, state: FSMContext):
         await message.answer("Do‘kon ID faqat raqamlardan iborat bo‘lishi kerak. Qayta kiriting:")
         return
 
-    save_store(message.from_user.id, store_id)
+    wait_msg = await message.answer("🔄 Do‘kon tekshirilmoqda...")
 
-    await message.answer(
-        f"✅ Do‘kon muvaffaqiyatli ulandi!\n\n"
-        f"🏪 Do‘kon ID: {store_id}\n\n"
-        f"Endi bron qilishingiz mumkin.",
-        reply_markup=main_menu()
+    used_by = store_used_by_other_user(store_id, message.from_user.id)
+
+    if used_by:
+        await wait_msg.edit_text(
+            "❌ Bu do‘kon allaqachon boshqa Telegram accountga ulangan.\n\n"
+            "Agar bu sizning do‘koningiz bo‘lsa, admin bilan bog‘laning."
+        )
+        await state.clear()
+        return
+
+    store_name = await uzum_get_shop_name(store_id)
+
+    save_store(message.from_user.id, store_id, store_name)
+
+    await wait_msg.edit_text(
+        f"✅ Do‘kon muvaffaqiyatli bog‘landi!\n\n"
+        f"🏪 Do‘kon: {store_name}\n"
+        f"🆔 Do‘kon ID: {store_id}\n\n"
+        f"Endi bron qilishingiz mumkin."
     )
 
     await state.clear()
 
 
-# ================= BOOKING =================
-
-@dp.callback_query(F.data == "new_booking")
-async def new_booking(callback: CallbackQuery, state: FSMContext):
-    if is_blocked(callback.from_user.id):
-        await callback.message.answer("Siz botdan foydalanishdan bloklangansiz.")
-        await callback.answer()
-        return
-
-    telegram_id = callback.from_user.id
-
-    if telegram_id in active_searches:
-        await callback.message.answer(
-            "⚠️ Faol qidiruv mavjud.\n"
-            "Avval qidiruvni to‘xtating, keyin yangi bron qiling.",
-            reply_markup=main_menu()
-        )
-        await callback.answer()
-        return
-
-    store_id = get_store(telegram_id)
-
-    if not store_id:
-        await callback.message.answer("Avval do‘koningizni ulang.", reply_markup=main_menu())
-        await callback.answer()
-        return
-
-    stars = get_stars(telegram_id)
-
-    if stars <= 0:
-        await callback.message.answer(
-            "Balansingizda yulduz yo‘q.\n"
-            "Bron qilish uchun balansni to‘ldiring."
-        )
-        await callback.answer()
-        return
-
-    await callback.message.answer(
-        "Invoice raqamini kiriting.\n\n"
-        "2 xil ko‘rinishda yuborishingiz mumkin:\n\n"
-        "1) Invoice raqam:\n"
-        "110003534443\n\n"
-        "2) Invoice ID:\n"
-        "3534443"
-    )
-
-    await state.set_state(BookingState.waiting_invoice)
-    await callback.answer()
-
-
-@dp.message(BookingState.waiting_invoice)
-async def get_invoice(message: Message, state: FSMContext):
+@dp.message(F.text == "🏬 Mening do‘konlarim")
+async def my_stores(message: Message):
     if await blocked_guard(message):
-        await state.clear()
         return
 
-    invoice = message.text.strip()
+    stores = get_user_stores(message.from_user.id)
 
-    if len(invoice) < 3:
-        await message.answer("Invoice noto‘g‘ri ko‘rinadi. Qayta kiriting:")
+    if not stores:
+        await message.answer("Sizda hali do‘kon ulanmagan.", reply_markup=main_menu())
         return
 
-    await state.update_data(invoice=invoice)
-    await message.answer("Sanani tanlang:", reply_markup=date_menu())
+    text = "🏬 Mening do‘konlarim:\n\n"
+    for _, store_id, store_name, created_at in stores:
+        text += f"🏪 {store_name}\n🆔 {store_id}\n📅 {created_at}\n\n"
+
+    await message.answer(text, reply_markup=stores_list_keyboard(stores))
 
 
-@dp.callback_query(F.data == "date_today")
-async def date_today(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(date="Bugun")
-    await show_booking_confirm(callback.message, callback.from_user.id, state)
+@dp.callback_query(F.data.startswith("delete_store:"))
+async def delete_store_callback(callback: CallbackQuery):
+    row_id = int(callback.data.split(":")[1])
+    delete_store(row_id, callback.from_user.id)
+    await callback.message.answer("✅ Do‘kon o‘chirildi.", reply_markup=main_menu())
     await callback.answer()
 
 
-@dp.callback_query(F.data == "date_tomorrow")
-async def date_tomorrow(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(date="Ertaga")
-    await show_booking_confirm(callback.message, callback.from_user.id, state)
-    await callback.answer()
+@dp.message(F.text == "⭐ Balans")
+async def balance(message: Message):
+    add_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
+    stars = get_stars(message.from_user.id)
+    await message.answer(f"⭐ Sizning balansingiz: {stars} yulduz", reply_markup=main_menu())
 
 
-@dp.callback_query(F.data == "date_custom")
-async def date_custom(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer("Sanani yozing. Masalan: 28.05.2026")
-    await state.set_state(BookingState.waiting_custom_date)
-    await callback.answer()
-
-
-@dp.message(BookingState.waiting_custom_date)
-async def custom_date(message: Message, state: FSMContext):
-    if await blocked_guard(message):
-        await state.clear()
-        return
-
-    await state.update_data(date=message.text.strip())
-    await show_booking_confirm(message, message.from_user.id, state)
-
-
-async def show_booking_confirm(message: Message, telegram_id: int, state: FSMContext):
-    data = await state.get_data()
-    store_id = get_store(telegram_id)
-
-    await message.answer(
-        f"📋 Bron ma’lumotlari:\n\n"
-        f"🏪 Do‘kon ID: {store_id}\n"
-        f"📦 Invoice: {data.get('invoice')}\n"
-        f"📅 Sana: {data.get('date')}\n"
-        f"⭐ Sarflanadi: 1 yulduz\n\n"
-        f"Tasdiqlaysizmi?",
-        reply_markup=confirm_menu()
-    )
-
-    await state.set_state(BookingState.confirming)
-
-
-@dp.callback_query(F.data == "confirm_booking")
-async def confirm_booking(callback: CallbackQuery, state: FSMContext):
-    if is_blocked(callback.from_user.id):
-        await callback.message.answer("Siz botdan foydalanishdan bloklangansiz.")
-        await state.clear()
-        await callback.answer()
-        return
-
-    telegram_id = callback.from_user.id
-    data = await state.get_data()
-
-    store_id = get_store(telegram_id)
-    stars = get_stars(telegram_id)
-    invoice_text = data.get("invoice")
-    selected_date = data.get("date")
-
-    if stars <= 0:
-        await callback.message.answer("Balansingizda yulduz yo‘q.")
-        await state.clear()
-        await callback.answer()
-        return
-
-    await state.clear()
-
-    try:
-        invoice_id = await uzum_find_invoice_id(store_id, invoice_text)
-    except Exception as e:
-        await callback.message.answer(
-            f"❌ Invoice topilmadi.\n\nXato: {e}",
-            reply_markup=main_menu()
-        )
-        await callback.answer()
-        return
-
-    active_searches[telegram_id] = {
-        "store_id": store_id,
-        "invoice_id": invoice_id,
-        "invoice_text": invoice_text,
-        "date": selected_date
-    }
-
-    asyncio.create_task(
-        auto_search_slot(
-            telegram_id=telegram_id,
-            store_id=store_id,
-            invoice_id=invoice_id,
-            invoice_text=invoice_text,
-            date_text=selected_date
-        )
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "cancel_booking")
-async def cancel_booking(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.answer("Bron bekor qilindi.", reply_markup=main_menu())
-    await callback.answer()
-
-
-# ================= BALANCE / PAYMENT / HISTORY =================
-
-@dp.callback_query(F.data == "balance")
-async def balance(callback: CallbackQuery):
-    add_user(callback.from_user.id, callback.from_user.full_name, callback.from_user.username)
-    stars = get_stars(callback.from_user.id)
-
-    await callback.message.answer(
-        f"⭐ Sizning balansingiz: {stars} yulduz",
-        reply_markup=main_menu()
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "buy_stars")
-async def buy_stars(callback: CallbackQuery):
-    await callback.message.answer(
-        f"💳 Yulduz sotib olish\n\n"
-        f"⭐ Tariflar:\n\n"
-        f"10 yulduz — 10 000 so‘m\n"
-        f"50 yulduz — 45 000 so‘m\n"
-        f"100 yulduz — 80 000 so‘m\n\n"
-        f"To‘lov qilganingizdan keyin chekni adminga yuboring.\n\n"
-        f"Sizning Telegram ID: {callback.from_user.id}",
-        reply_markup=main_menu()
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "history")
-async def history(callback: CallbackQuery):
-    rows = get_user_bookings(callback.from_user.id)
+@dp.message(F.text == "📜 Bronlar tarixi")
+async def history(message: Message):
+    rows = get_user_bookings(message.from_user.id)
 
     if not rows:
-        await callback.message.answer("Sizda hali bronlar yo‘q.", reply_markup=main_menu())
-        await callback.answer()
+        await message.answer("Sizda hali bronlar yo‘q.", reply_markup=main_menu())
         return
 
     text = "📜 Oxirgi bronlar tarixi:\n\n"
 
-    for row in rows:
-        store_id, invoice, date, status, result, created_at = row
+    for store_name, store_id, invoice, date, status, result, created_at in rows:
         text += (
-            f"🏪 Do‘kon ID: {store_id}\n"
+            f"🏪 {store_name} ({store_id})\n"
             f"📦 Invoice: {invoice}\n"
             f"📅 Sana: {date}\n"
             f"Holat: {status}\n"
@@ -998,11 +1127,460 @@ async def history(callback: CallbackQuery):
             f"Vaqt: {created_at}\n\n"
         )
 
+    await message.answer(text, reply_markup=main_menu())
+
+
+# ================= BOOKING FLOW =================
+
+@dp.message(F.text == "📦 Yangi bron")
+async def new_booking(message: Message, state: FSMContext):
+    if await blocked_guard(message):
+        return
+
+    stores = get_user_stores(message.from_user.id)
+
+    if not stores:
+        await message.answer("Avval do‘kon qo‘shing.", reply_markup=main_menu())
+        return
+
+    if get_stars(message.from_user.id) <= 0:
+        await message.answer(
+            "❌ Yetarli yulduz yo‘q!\n\n"
+            "Kerak: kamida 1 yulduz\n"
+            f"Sizda: {get_stars(message.from_user.id)} yulduz\n\n"
+            "⭐ Yulduz sotib olish tugmasini bosing.",
+            reply_markup=main_menu()
+        )
+        return
+
+    if len(stores) == 1:
+        row_id, store_id, store_name, _ = stores[0]
+        await state.update_data(store_db_id=row_id, store_id=store_id, store_name=store_name)
+        await ask_invoices(message, state)
+        return
+
+    await message.answer(
+        "🏪 Qaysi do‘kondan bron qilamiz?",
+        reply_markup=store_select_keyboard(stores)
+    )
+    await state.set_state(BookingState.choosing_store)
+
+
+@dp.callback_query(F.data.startswith("select_store:"))
+async def select_store(callback: CallbackQuery, state: FSMContext):
+    row_id = int(callback.data.split(":")[1])
+    row = get_store_by_id(row_id, callback.from_user.id)
+
+    if not row:
+        await callback.message.answer("Do‘kon topilmadi.", reply_markup=main_menu())
+        await callback.answer()
+        return
+
+    _, _, store_id, store_name = row
+    await state.update_data(store_db_id=row_id, store_id=store_id, store_name=store_name)
+
+    await callback.message.answer(f"✅ Tanlandi: {store_name}")
+    await ask_invoices(callback.message, state)
+    await callback.answer()
+
+
+async def ask_invoices(message: Message, state: FSMContext):
+    await message.answer(
+        "📦 Invoice raqamlarini vergul bilan kiriting:\n\n"
+        "Masalan:\n"
+        "3535244, 3535245\n"
+        "yoki:\n"
+        "110003535244, 110003535245\n\n"
+        "Invoice raqamini Uzum Seller → Buyurtmalar bo‘limida topishingiz mumkin."
+    )
+    await state.set_state(BookingState.waiting_invoice)
+
+
+@dp.message(BookingState.waiting_invoice)
+async def get_invoices(message: Message, state: FSMContext):
+    if await blocked_guard(message):
+        await state.clear()
+        return
+
+    invoices = parse_invoice_list(message.text)
+
+    if not invoices:
+        await message.answer("Invoice topilmadi. Qayta kiriting:")
+        return
+
+    await state.update_data(invoices=invoices, selected_dates=[])
+    await message.answer(
+        "📅 Sanani tanlang (bir yoki bir nechtasini):\n\n"
+        "Tanlab bo‘lgach “✅ Tayyor” tugmasini bosing.",
+        reply_markup=dates_keyboard([])
+    )
+    await state.set_state(BookingState.choosing_dates)
+
+
+@dp.callback_query(F.data.startswith("date_toggle:"))
+async def toggle_date(callback: CallbackQuery, state: FSMContext):
+    date_text = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    selected_dates = data.get("selected_dates", [])
+
+    if date_text in selected_dates:
+        selected_dates.remove(date_text)
+    else:
+        selected_dates.append(date_text)
+
+    await state.update_data(selected_dates=selected_dates)
+
+    selected_text = ", ".join(selected_dates) if selected_dates else "hali tanlanmadi"
+
+    await callback.message.edit_text(
+        "📅 Sanani tanlang (bir yoki bir nechtasini):\n\n"
+        f"Tanlangan sanalar: {selected_text}\n\n"
+        "Tanlab bo‘lgach “✅ Tayyor” tugmasini bosing.",
+        reply_markup=dates_keyboard(selected_dates)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "dates_done")
+async def dates_done(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    selected_dates = data.get("selected_dates", [])
+
+    if not selected_dates:
+        await callback.answer("Kamida bitta sana tanlang.", show_alert=True)
+        return
+
+    store_name = data.get("store_name")
+    store_id = data.get("store_id")
+    invoices = data.get("invoices", [])
+
+    await callback.message.answer(
+        "📋 Bron ma’lumotlari:\n\n"
+        f"🏪 Do‘kon: {store_name}\n"
+        f"🆔 Do‘kon ID: {store_id}\n"
+        f"📦 Invoice: {', '.join(invoices)}\n"
+        f"📅 Sanalar: {', '.join(selected_dates)}\n"
+        f"⭐ Sarflanadi: har muvaffaqiyatli bron uchun 1 yulduz\n\n"
+        "Tasdiqlaysizmi?",
+        reply_markup=confirm_keyboard()
+    )
+    await state.set_state(BookingState.confirming)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "confirm_booking")
+async def confirm_booking(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+
+    telegram_id = callback.from_user.id
+    store_id = data.get("store_id")
+    store_name = data.get("store_name")
+    invoices = data.get("invoices", [])
+    selected_dates = data.get("selected_dates", [])
+
+    if get_stars(telegram_id) <= 0:
+        await callback.message.answer(
+            "❌ Yetarli yulduz yo‘q.\n\n"
+            "Qidiruv boshlanmadi.",
+            reply_markup=main_menu()
+        )
+        await state.clear()
+        await callback.answer()
+        return
+
+    started = 0
+    errors = []
+
+    for invoice_text in invoices:
+        try:
+            invoice_id = await uzum_find_invoice_id(store_id, invoice_text)
+            search_id = uuid.uuid4().hex[:8]
+
+            active_searches[search_id] = {
+                "telegram_id": telegram_id,
+                "store_id": store_id,
+                "store_name": store_name,
+                "invoice_id": invoice_id,
+                "invoice_text": invoice_text,
+                "dates": selected_dates,
+                "started_at": now(),
+            }
+
+            asyncio.create_task(auto_search_slot(search_id))
+            started += 1
+
+        except Exception as e:
+            errors.append(f"{invoice_text}: {e}")
+
+    await state.clear()
+
+    text = (
+        f"✅ Qidiruv boshlandi!\n\n"
+        f"🏪 Do‘kon: {store_name}\n"
+        f"📦 Boshlangan qidiruvlar: {started} ta\n"
+        f"📅 Sanalar: {', '.join(selected_dates)}\n"
+        f"⏱ Interval: {SEARCH_INTERVAL} sekund\n"
+        f"⏳ Davomiylik: {SEARCH_HOURS} soat\n\n"
+        f"Slot topilsa avtomatik bron qilinadi."
+    )
+
+    if errors:
+        text += "\n\n⚠️ Ayrim invoice’larda xato:\n" + "\n".join(errors[:5])
+
     await callback.message.answer(text, reply_markup=main_menu())
     await callback.answer()
 
 
-# ================= ADMIN PANEL =================
+@dp.callback_query(F.data == "cancel_booking")
+async def cancel_booking(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer("Bekor qilindi.", reply_markup=main_menu())
+    await callback.answer()
+
+
+# ================= ACTIVE SEARCHES =================
+
+@dp.message(F.text == "🔍 Faol qidiruvlar")
+async def active_searches_user(message: Message):
+    user_items = {
+        sid: item for sid, item in active_searches.items()
+        if item["telegram_id"] == message.from_user.id
+    }
+
+    if not user_items:
+        await message.answer("Faol qidiruv yo‘q.", reply_markup=main_menu())
+        return
+
+    text = "🔍 Faol qidiruvlar:\n\n"
+
+    for sid, item in user_items.items():
+        text += (
+            f"ID: {sid}\n"
+            f"🏪 {item['store_name']}\n"
+            f"📦 Invoice: {item['invoice_text']}\n"
+            f"📅 Sanalar: {', '.join(item['dates'])}\n"
+            f"Boshlangan: {item['started_at']}\n\n"
+        )
+
+    await message.answer(text, reply_markup=search_stop_keyboard(user_items))
+
+
+@dp.message(F.text == "🛑 Qidiruvni to‘xtatish")
+async def stop_search_menu(message: Message):
+    user_items = {
+        sid: item for sid, item in active_searches.items()
+        if item["telegram_id"] == message.from_user.id
+    }
+
+    if not user_items:
+        await message.answer("Faol qidiruv yo‘q.", reply_markup=main_menu())
+        return
+
+    await message.answer(
+        "Qaysi qidiruvni to‘xtatamiz?",
+        reply_markup=search_stop_keyboard(user_items)
+    )
+
+
+@dp.callback_query(F.data.startswith("stop_one:"))
+async def stop_one_search(callback: CallbackQuery):
+    search_id = callback.data.split(":")[1]
+    item = active_searches.get(search_id)
+
+    if not item:
+        await callback.answer("Qidiruv topilmadi.", show_alert=True)
+        return
+
+    if item["telegram_id"] != callback.from_user.id and not admin_check(callback.from_user.id):
+        await callback.answer("Ruxsat yo‘q.", show_alert=True)
+        return
+
+    active_searches.pop(search_id, None)
+
+    await callback.message.answer("🛑 Qidiruv to‘xtatildi.", reply_markup=main_menu())
+    await callback.answer()
+
+
+# ================= PAYMENTS =================
+
+@dp.message(F.text == "⭐ Yulduz sotib olish")
+async def buy_stars(message: Message):
+    stars = get_stars(message.from_user.id)
+
+    await message.answer(
+        f"⭐ Sizning balansingiz: {stars} yulduz\n\n"
+        "⭐ Yulduz paketini tanlang:\n\n"
+        "⭐ 1 yulduz — 25 000 so‘m\n"
+        "⭐ 2 yulduz — 45 000 so‘m\n"
+        "⭐ 5 yulduz — 100 000 so‘m",
+        reply_markup=star_plans_keyboard()
+    )
+
+
+@dp.callback_query(F.data.startswith("buy_plan:"))
+async def buy_plan(callback: CallbackQuery, state: FSMContext):
+    plan_key = callback.data.split(":")[1]
+    plan = STAR_PLANS.get(plan_key)
+
+    if not plan:
+        await callback.answer("Tarif topilmadi.", show_alert=True)
+        return
+
+    await state.update_data(plan_key=plan_key)
+
+    price_text = f"{plan['price']:,}".replace(",", " ")
+
+    await callback.message.answer(
+        "💳 To‘lov ma’lumotlari:\n\n"
+        f"⭐ Paket: {plan['stars']} yulduz\n"
+        f"💰 Summa: {price_text} so‘m\n\n"
+        f"💳 Karta: {PAYMENT_CARD}\n"
+        f"👤 Karta egasi: {PAYMENT_OWNER}\n\n"
+        "To‘lovdan so‘ng chek rasmini shu yerga yuboring."
+    )
+
+    await state.set_state(PaymentState.waiting_receipt)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "cancel_payment")
+async def cancel_payment(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer("To‘lov bekor qilindi.", reply_markup=main_menu())
+    await callback.answer()
+
+
+@dp.message(PaymentState.waiting_receipt)
+async def payment_receipt(message: Message, state: FSMContext):
+    data = await state.get_data()
+    plan_key = data.get("plan_key")
+    plan = STAR_PLANS.get(plan_key)
+
+    if not plan:
+        await message.answer("Tarif topilmadi. Qayta urinib ko‘ring.", reply_markup=main_menu())
+        await state.clear()
+        return
+
+    if not (message.photo or message.document):
+        await message.answer("Iltimos, chek rasmini yuboring.")
+        return
+
+    payment_id = uuid.uuid4().hex[:8]
+
+    pending_payments[payment_id] = {
+        "telegram_id": message.from_user.id,
+        "full_name": message.from_user.full_name,
+        "username": message.from_user.username or "",
+        "stars": plan["stars"],
+        "price": plan["price"],
+        "created_at": now(),
+    }
+
+    await message.answer(
+        "✅ Chek adminga yuborildi.\n"
+        "Tasdiqlangandan keyin balansingizga yulduz qo‘shiladi.",
+        reply_markup=main_menu()
+    )
+
+    if ADMIN_ID:
+        price_text = f"{plan['price']:,}".replace(",", " ")
+
+        admin_text = (
+            "🧾 Yangi to‘lov cheki\n\n"
+            f"Payment ID: {payment_id}\n"
+            f"👤 User: {message.from_user.full_name}\n"
+            f"🆔 User ID: {message.from_user.id}\n"
+            f"Username: @{message.from_user.username or '-'}\n"
+            f"⭐ Paket: {plan['stars']} yulduz\n"
+            f"💰 Summa: {price_text} so‘m\n"
+            f"📅 Vaqt: {now()}"
+        )
+
+        await bot.send_message(
+            ADMIN_ID,
+            admin_text,
+            reply_markup=admin_payment_keyboard(payment_id)
+        )
+
+        try:
+            await bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
+        except Exception:
+            pass
+
+    await state.clear()
+
+
+@dp.callback_query(F.data.startswith("pay_ok:"))
+async def payment_ok(callback: CallbackQuery):
+    if not admin_check(callback.from_user.id):
+        await callback.answer("Ruxsat yo‘q.", show_alert=True)
+        return
+
+    payment_id = callback.data.split(":")[1]
+    payment = pending_payments.pop(payment_id, None)
+
+    if not payment:
+        await callback.answer("To‘lov topilmadi yoki allaqachon ko‘rilgan.", show_alert=True)
+        return
+
+    user_id = payment["telegram_id"]
+    stars = payment["stars"]
+
+    change_stars(user_id, stars)
+    new_balance = get_stars(user_id)
+
+    await callback.message.answer(
+        f"✅ To‘lov tasdiqlandi.\n\n"
+        f"User ID: {user_id}\n"
+        f"Qo‘shildi: {stars} yulduz\n"
+        f"Yangi balans: {new_balance} yulduz"
+    )
+
+    try:
+        await bot.send_message(
+            user_id,
+            f"✅ To‘lov tasdiqlandi!\n\n"
+            f"⭐ +{stars} yulduz\n"
+            f"💰 Yangi balans: {new_balance} yulduz",
+            reply_markup=main_menu()
+        )
+    except Exception:
+        pass
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("pay_no:"))
+async def payment_no(callback: CallbackQuery):
+    if not admin_check(callback.from_user.id):
+        await callback.answer("Ruxsat yo‘q.", show_alert=True)
+        return
+
+    payment_id = callback.data.split(":")[1]
+    payment = pending_payments.pop(payment_id, None)
+
+    if not payment:
+        await callback.answer("To‘lov topilmadi yoki allaqachon ko‘rilgan.", show_alert=True)
+        return
+
+    user_id = payment["telegram_id"]
+
+    await callback.message.answer(f"❌ To‘lov rad etildi. User ID: {user_id}")
+
+    try:
+        await bot.send_message(
+            user_id,
+            "❌ To‘lov rad etildi.\n\n"
+            "Agar xato bo‘lsa, qayta chek yuboring.",
+            reply_markup=main_menu()
+        )
+    except Exception:
+        pass
+
+    await callback.answer()
+
+
+# ================= ADMIN =================
 
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats(callback: CallbackQuery):
@@ -1013,14 +1591,42 @@ async def admin_stats(callback: CallbackQuery):
     users_count, stores_count, bookings_count, blocked_count = get_stats()
 
     await callback.message.answer(
-        f"📊 Statistika:\n\n"
+        "📊 Statistika:\n\n"
         f"👥 Userlar: {users_count}\n"
         f"🏪 Do‘konlar: {stores_count}\n"
         f"📦 Bronlar: {bookings_count}\n"
+        f"🔍 Faol qidiruvlar: {len(active_searches)}\n"
         f"🚫 Bloklanganlar: {blocked_count}",
         reply_markup=admin_menu()
     )
 
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_active")
+async def admin_active(callback: CallbackQuery):
+    if not admin_check(callback.from_user.id):
+        await callback.answer("Ruxsat yo‘q.")
+        return
+
+    if not active_searches:
+        await callback.message.answer("Faol qidiruvlar yo‘q.", reply_markup=admin_menu())
+        await callback.answer()
+        return
+
+    text = "🔍 Faol qidiruvlar:\n\n"
+
+    for sid, item in active_searches.items():
+        text += (
+            f"ID: {sid}\n"
+            f"User ID: {item['telegram_id']}\n"
+            f"🏪 {item['store_name']} ({item['store_id']})\n"
+            f"📦 Invoice: {item['invoice_text']}\n"
+            f"📅 Sanalar: {', '.join(item['dates'])}\n"
+            f"Boshlangan: {item['started_at']}\n\n"
+        )
+
+    await callback.message.answer(text, reply_markup=admin_menu())
     await callback.answer()
 
 
@@ -1039,8 +1645,7 @@ async def admin_users(callback: CallbackQuery):
 
     text = "👥 Oxirgi userlar:\n\n"
 
-    for row in rows:
-        telegram_id, full_name, username, stars, blocked, created_at = row
+    for telegram_id, full_name, username, stars, blocked, created_at in rows:
         username_text = f"@{username}" if username else "username yo‘q"
         status = "🚫 Blok" if blocked else "✅ Aktiv"
 
@@ -1072,11 +1677,10 @@ async def admin_stores(callback: CallbackQuery):
 
     text = "🏪 Oxirgi ulangan do‘konlar:\n\n"
 
-    for row in rows:
-        store_id, telegram_id, full_name, username, created_at = row
+    for store_id, store_name, telegram_id, full_name, username, created_at in rows:
         username_text = f"@{username}" if username else "username yo‘q"
-
         text += (
+            f"🏪 {store_name}\n"
             f"Do‘kon ID: {store_id}\n"
             f"User ID: {telegram_id}\n"
             f"Ism: {full_name}\n"
@@ -1103,12 +1707,11 @@ async def admin_bookings(callback: CallbackQuery):
 
     text = "📦 Oxirgi bronlar:\n\n"
 
-    for row in rows:
-        telegram_id, full_name, store_id, invoice, date, status, result, created_at = row
+    for telegram_id, full_name, store_name, store_id, invoice, date, status, result, created_at in rows:
         text += (
             f"User ID: {telegram_id}\n"
             f"Ism: {full_name}\n"
-            f"Do‘kon ID: {store_id}\n"
+            f"Do‘kon: {store_name} ({store_id})\n"
             f"Invoice: {invoice}\n"
             f"Sana: {date}\n"
             f"Holat: {status}\n"
@@ -1172,7 +1775,11 @@ async def admin_get_star_amount(message: Message, state: FSMContext):
     )
 
     try:
-        await bot.send_message(target_user_id, f"⭐ Balansingizga {amount} yulduz qo‘shildi.")
+        await bot.send_message(
+            target_user_id,
+            f"⭐ Balansingizga {amount} yulduz qo‘shildi.",
+            reply_markup=main_menu()
+        )
     except Exception:
         pass
 
@@ -1244,8 +1851,7 @@ async def admin_block_user_id(message: Message, state: FSMContext):
     set_block_status(int(user_id), 1)
 
     await message.answer(
-        f"🚫 User bloklandi.\n\n"
-        f"User ID: {user_id}",
+        f"🚫 User bloklandi.\n\nUser ID: {user_id}",
         reply_markup=admin_menu()
     )
 
@@ -1282,8 +1888,7 @@ async def admin_unblock_user_id(message: Message, state: FSMContext):
     set_block_status(int(user_id), 0)
 
     await message.answer(
-        f"✅ User blokdan chiqarildi.\n\n"
-        f"User ID: {user_id}",
+        f"✅ User blokdan chiqarildi.\n\nUser ID: {user_id}",
         reply_markup=admin_menu()
     )
 
