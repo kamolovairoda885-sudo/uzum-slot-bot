@@ -338,6 +338,57 @@ def date_to_timestamp_ms(date_text: str):
         return int(dt.timestamp() * 1000)
     except Exception:
         return int(time.time() * 1000)
+        def normalize_date_text(date_text: str):
+    value = (date_text or "").strip().lower()
+
+    now_uz = datetime.utcnow() + timedelta(hours=5)
+
+    if value == "bugun":
+        return now_uz.strftime("%d.%m.%Y")
+
+    if value == "ertaga":
+        return (now_uz + timedelta(days=1)).strftime("%d.%m.%Y")
+
+    try:
+        dt = datetime.strptime(date_text.strip(), "%d.%m.%Y")
+        return dt.strftime("%d.%m.%Y")
+    except Exception:
+        return now_uz.strftime("%d.%m.%Y")
+
+
+def slot_date_text(time_from):
+    ts = int(time_from)
+
+    if ts < 10_000_000_000:
+        ts *= 1000
+
+    dt_uz = datetime.utcfromtimestamp(ts / 1000) + timedelta(hours=5)
+    return dt_uz.strftime("%d.%m.%Y")def normalize_date_text(date_text: str):
+    value = (date_text or "").strip().lower()
+
+    now_uz = datetime.utcnow() + timedelta(hours=5)
+
+    if value == "bugun":
+        return now_uz.strftime("%d.%m.%Y")
+
+    if value == "ertaga":
+        return (now_uz + timedelta(days=1)).strftime("%d.%m.%Y")
+
+    try:
+        dt = datetime.strptime(date_text.strip(), "%d.%m.%Y")
+        return dt.strftime("%d.%m.%Y")
+    except Exception:
+        return now_uz.strftime("%d.%m.%Y")
+
+
+def slot_date_text(time_from):
+    ts = int(time_from)
+
+    if ts < 10_000_000_000:
+        ts *= 1000
+
+    dt_uz = datetime.utcfromtimestamp(ts / 1000) + timedelta(hours=5)
+    return dt_uz.strftime("%d.%m.%Y")
 
 
 async def uzum_find_invoice_id(shop_id: str, invoice_text: str):
@@ -446,7 +497,7 @@ async def auto_search_slot(telegram_id: int, store_id: str, invoice_id: int, inv
         except Exception as e:
             pass
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(3)
 
     # 3 soat tugadi
     active_searches.pop(telegram_id, None)
