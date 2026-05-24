@@ -34,7 +34,7 @@ UZUM_POOL_SOURCE = os.getenv("UZUM_POOL_SOURCE", "FULLFILMENT")
 UZUM_STOCK_ID = int(os.getenv("UZUM_STOCK_ID", "34"))
 
 SEARCH_INTERVAL = int(os.getenv("SEARCH_INTERVAL", "3"))
-SEARCH_HOURS = int(os.getenv("SEARCH_HOURS", "3"))
+SEARCH_HOURS = int(os.getenv("SEARCH_HOURS", "4"))
 
 PAYMENT_CARD = os.getenv("PAYMENT_CARD", "0000 0000 0000 0000")
 PAYMENT_OWNER = os.getenv("PAYMENT_OWNER", "Ism Familiya")
@@ -57,6 +57,7 @@ STAR_PLANS = {
     "1": {"stars": 1, "price": 25000},
     "2": {"stars": 2, "price": 45000},
     "5": {"stars": 5, "price": 100000},
+    "10": {"stars": 10, "price": 180000},
 }
 
 
@@ -783,6 +784,7 @@ def star_plans_keyboard():
     kb.button(text="⭐ 1 yulduz — 25 000 so‘m", callback_data="buy_plan:1")
     kb.button(text="⭐ 2 yulduz — 45 000 so‘m", callback_data="buy_plan:2")
     kb.button(text="⭐ 5 yulduz — 100 000 so‘m", callback_data="buy_plan:5")
+    kb.button(text="⭐ 10 yulduz — 180 000 so‘m", callback_data="buy_plan:10")
     kb.button(text="❌ Bekor qilish", callback_data="cancel_payment")
     kb.adjust(1)
     return kb.as_markup()
@@ -834,6 +836,12 @@ class AdminState(StatesGroup):
 
 # ================= SEARCH WORKER =================
 
+async def refund_reserved_star(search_id, item):
+    if item and item.get("star_reserved"):
+        change_stars(item["telegram_id"], 1)
+        item["star_reserved"] = False
+
+
 async def auto_search_slot(search_id: str):
     item = active_searches.get(search_id)
     if not item:
@@ -850,33 +858,17 @@ async def auto_search_slot(search_id: str):
 
     await bot.send_message(
         telegram_id,
-        f"🔍 Qidiruv boshlandi!\n\n"
+        "🔍 Qidiruv boshlandi!\n\n"
         f"🏪 Do‘kon: {store_name}\n"
         f"📦 Invoice: {invoice_text}\n"
         f"📅 Sanalar: {', '.join(dates)}\n\n"
-        f"⏱ Har {SEARCH_INTERVAL} sekundda tekshiriladi.\n"
-        f"⏳ {SEARCH_HOURS} soat ichida slot topilmasa to‘xtatiladi.",
+        "⏳ Bu bir necha daqiqa vaqt olishi mumkin...\n"
+        f"Agar {SEARCH_HOURS} soat ichida slot topilmasa, keyinroq qayta urinib ko‘rishingiz mumkin.",
         reply_markup=main_menu()
     )
 
     while time.time() < deadline:
         if search_id not in active_searches:
-            return
-
-        if get_stars(telegram_id) <= 0:
-            save_booking(
-                telegram_id, store_id, store_name, invoice_text,
-                ", ".join(dates), "stopped_no_stars", "Balansda yulduz qolmadi"
-            )
-            active_searches.pop(search_id, None)
-
-            await bot.send_message(
-                telegram_id,
-                f"❌ Qidiruv to‘xtadi.\n\n"
-                f"📦 Invoice: {invoice_text}\n"
-                f"Sabab: balansda yulduz qolmadi.",
-                reply_markup=main_menu()
-            )
             return
 
         try:
@@ -903,8 +895,6 @@ async def auto_search_slot(search_id: str):
                     try:
                         await uzum_set_slot(store_id, invoice_id, time_from)
 
-                        change_stars(telegram_id, -1)
-
                         save_booking(
                             telegram_id,
                             store_id,
@@ -924,7 +914,7 @@ async def auto_search_slot(search_id: str):
                             f"📦 Invoice: {invoice_text}\n"
                             f"📅 Bron qilingan sana: {wanted_date}\n"
                             f"⏰ timeFrom: {time_from}\n\n"
-                            f"⭐ 1 yulduz yechildi.",
+                            f"⭐ 1 yulduz ishlatildi.",
                             reply_markup=main_menu()
                         )
                         return
@@ -933,6 +923,9 @@ async def auto_search_slot(search_id: str):
                         continue
 
         except Exception as e:
+            item = active_searches.get(search_id)
+            await refund_reserved_star(search_id, item)
+
             save_booking(
                 telegram_id,
                 store_id,
@@ -942,6 +935,7 @@ async def auto_search_slot(search_id: str):
                 "error",
                 str(e)
             )
+
             active_searches.pop(search_id, None)
 
             await bot.send_message(
@@ -949,12 +943,15 @@ async def auto_search_slot(search_id: str):
                 f"❌ Qidiruvda xato chiqdi.\n\n"
                 f"📦 Invoice: {invoice_text}\n"
                 f"Xato: {e}\n\n"
-                f"Yulduz yechilmadi.",
+                f"⭐ Yulduz qaytarildi.",
                 reply_markup=main_menu()
             )
             return
 
         await asyncio.sleep(SEARCH_INTERVAL)
+
+    item = active_searches.get(search_id)
+    await refund_reserved_star(search_id, item)
 
     active_searches.pop(search_id, None)
 
@@ -975,7 +972,8 @@ async def auto_search_slot(search_id: str):
         f"🏪 Do‘kon: {store_name}\n"
         f"📦 Invoice: {invoice_text}\n"
         f"📅 Sanalar: {', '.join(dates)}\n\n"
-        f"Yulduz yechilmadi.",
+        "Keyinroq qayta urinib ko‘rishingiz mumkin.\n"
+        "⭐ Yulduz qaytarildi.",
         reply_markup=main_menu()
     )
 
@@ -1253,6 +1251,7 @@ async def dates_done(callback: CallbackQuery, state: FSMContext):
     store_name = data.get("store_name")
     store_id = data.get("store_id")
     invoices = data.get("invoices", [])
+    user_stars = get_stars(callback.from_user.id)
 
     await callback.message.answer(
         "📋 Bron ma’lumotlari:\n\n"
@@ -1260,7 +1259,8 @@ async def dates_done(callback: CallbackQuery, state: FSMContext):
         f"🆔 Do‘kon ID: {store_id}\n"
         f"📦 Invoice: {', '.join(invoices)}\n"
         f"📅 Sanalar: {', '.join(selected_dates)}\n"
-        f"⭐ Sarflanadi: har muvaffaqiyatli bron uchun 1 yulduz\n\n"
+        f"⭐ Kerak bo‘ladi: {len(invoices)} yulduz\n"
+        f"⭐ Sizda: {user_stars} yulduz\n\n"
         "Tasdiqlaysizmi?",
         reply_markup=confirm_keyboard()
     )
@@ -1278,10 +1278,15 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext):
     invoices = data.get("invoices", [])
     selected_dates = data.get("selected_dates", [])
 
-    if get_stars(telegram_id) <= 0:
+    required_stars = len(invoices)
+    user_stars = get_stars(telegram_id)
+
+    if user_stars < required_stars:
         await callback.message.answer(
             "❌ Yetarli yulduz yo‘q.\n\n"
-            "Qidiruv boshlanmadi.",
+            f"Kerak: {required_stars} yulduz\n"
+            f"Sizda: {user_stars} yulduz\n\n"
+            "Har bir invoice uchun 1 yulduz kerak bo‘ladi.",
             reply_markup=main_menu()
         )
         await state.clear()
@@ -1294,6 +1299,9 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext):
     for invoice_text in invoices:
         try:
             invoice_id = await uzum_find_invoice_id(store_id, invoice_text)
+
+            change_stars(telegram_id, -1)
+
             search_id = uuid.uuid4().hex[:8]
 
             active_searches[search_id] = {
@@ -1304,6 +1312,7 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext):
                 "invoice_text": invoice_text,
                 "dates": selected_dates,
                 "started_at": now(),
+                "star_reserved": True,
             }
 
             asyncio.create_task(auto_search_slot(search_id))
@@ -1315,13 +1324,14 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext):
     await state.clear()
 
     text = (
-        f"✅ Qidiruv boshlandi!\n\n"
+        "✅ Qidiruv boshlandi!\n\n"
         f"🏪 Do‘kon: {store_name}\n"
         f"📦 Boshlangan qidiruvlar: {started} ta\n"
-        f"📅 Sanalar: {', '.join(selected_dates)}\n"
-        f"⏱ Interval: {SEARCH_INTERVAL} sekund\n"
-        f"⏳ Davomiylik: {SEARCH_HOURS} soat\n\n"
-        f"Slot topilsa avtomatik bron qilinadi."
+        f"📅 Sanalar: {', '.join(selected_dates)}\n\n"
+        "⏳ Bu bir necha daqiqa vaqt olishi mumkin...\n"
+        f"Agar {SEARCH_HOURS} soat ichida slot topilmasa, yana qayta urinib ko‘rishingiz mumkin.\n\n"
+        "⭐ Har bir qidiruv uchun 1 yulduz band qilindi.\n"
+        "Slot topilmasa yoki qidiruv to‘xtatilsa, yulduz qaytariladi."
     )
 
     if errors:
@@ -1395,9 +1405,14 @@ async def stop_one_search(callback: CallbackQuery):
         await callback.answer("Ruxsat yo‘q.", show_alert=True)
         return
 
+    await refund_reserved_star(search_id, item)
     active_searches.pop(search_id, None)
 
-    await callback.message.answer("🛑 Qidiruv to‘xtatildi.", reply_markup=main_menu())
+    await callback.message.answer(
+        "🛑 Qidiruv to‘xtatildi.\n\n"
+        "⭐ Yulduz qaytarildi.",
+        reply_markup=main_menu()
+    )
     await callback.answer()
 
 
@@ -1412,7 +1427,8 @@ async def buy_stars(message: Message):
         "⭐ Yulduz paketini tanlang:\n\n"
         "⭐ 1 yulduz — 25 000 so‘m\n"
         "⭐ 2 yulduz — 45 000 so‘m\n"
-        "⭐ 5 yulduz — 100 000 so‘m",
+        "⭐ 5 yulduz — 100 000 so‘m\n"
+        "⭐ 10 yulduz — 180 000 so‘m",
         reply_markup=star_plans_keyboard()
     )
 
