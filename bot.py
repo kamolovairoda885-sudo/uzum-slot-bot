@@ -508,7 +508,6 @@ async def uzum_get_shop_name(shop_id: str):
                     exact_name = find_shop_name_by_id(data, shop_id)
                     if exact_name:
                         return exact_name
-
                     name = find_key_recursive(
                         data,
                         ["name", "shopName", "title", "storeName", "sellerName"]
