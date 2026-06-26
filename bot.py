@@ -768,7 +768,9 @@ START_TEXT = (
     "✅ Bir nechta invoice bo'yicha qidirish\n"
     "✅ Tanlangan sana bo'yicha slot qidirish\n"
     "✅ Slot topilsa avtomatik bron qilish\n\n"
-    "⚠️ Bot javob bermasa /start ni bosing."
+    "🎬 Botdan foydalanish qo'llanmasi: https://youtu.be/5G54WLsr4rY\n"
+    "📢 Kanal: https://t.me/uzumtimeslot\n\n"
+    "⚠️ Bot javob bermasa /start ni bosing.""📦 Uzum Time Slot Bot\n\n"
 )
 
 
