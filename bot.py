@@ -1,7 +1,7 @@
 import asyncio
 import os
 import re
-import sqlite3
+import psycopg2
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -47,11 +47,15 @@ ADMIN_ID = int(ADMIN_ID) if ADMIN_ID and ADMIN_ID.isdigit() else 0
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-DB_NAME = "bot.db"
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL topilmadi. Railway worker Variables ichida DATABASE_URL bo'lishi kerak.")
+
 UZ_TZ = timezone(timedelta(hours=5))
 
 active_searches = {}
 pending_payments = {}
+http_session = None
 
 STAR_PLANS = {
     "1": {"stars": 1, "price": 25000},
@@ -61,17 +65,10 @@ STAR_PLANS = {
 }
 
 
-# ================= DATABASE =================
+# ================= DATABASE (PostgreSQL) =================
 
 def db():
-    return sqlite3.connect(DB_NAME)
-
-
-def ensure_column(cur, table, column, column_type):
-    cur.execute(f"PRAGMA table_info({table})")
-    columns = [row[1] for row in cur.fetchall()]
-    if column not in columns:
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+    return psycopg2.connect(DATABASE_URL)
 
 
 def init_db():
@@ -80,7 +77,7 @@ def init_db():
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            telegram_id INTEGER PRIMARY KEY,
+            telegram_id BIGINT PRIMARY KEY,
             full_name TEXT,
             username TEXT,
             stars INTEGER DEFAULT 1,
@@ -91,8 +88,8 @@ def init_db():
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS stores (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT,
             store_id TEXT,
             store_name TEXT,
             created_at TEXT
@@ -101,8 +98,8 @@ def init_db():
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bookings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT,
             store_id TEXT,
             store_name TEXT,
             invoice TEXT,
@@ -113,13 +110,10 @@ def init_db():
         )
     """)
 
-    ensure_column(cur, "users", "username", "TEXT")
-    ensure_column(cur, "users", "stars", "INTEGER DEFAULT 1")
-    ensure_column(cur, "users", "is_blocked", "INTEGER DEFAULT 0")
-    ensure_column(cur, "users", "created_at", "TEXT")
-    ensure_column(cur, "stores", "store_name", "TEXT")
-    ensure_column(cur, "bookings", "store_name", "TEXT")
-    ensure_column(cur, "bookings", "result", "TEXT")
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_stores_user_store ON stores (telegram_id, store_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_stores_telegram_id ON stores (telegram_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_bookings_telegram_id ON bookings (telegram_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_blocked ON users (is_blocked)")
 
     conn.commit()
     conn.close()
@@ -132,18 +126,16 @@ def now():
 def add_user(telegram_id, full_name="", username=""):
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT telegram_id FROM users WHERE telegram_id = ?", (telegram_id,))
-    exists = cur.fetchone()
-    if not exists:
-        cur.execute(
-            "INSERT INTO users (telegram_id, full_name, username, stars, is_blocked, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (telegram_id, full_name or "", username or "", 1, 0, now())
-        )
-    else:
-        cur.execute(
-            "UPDATE users SET full_name = ?, username = ? WHERE telegram_id = ?",
-            (full_name or "", username or "", telegram_id)
-        )
+    cur.execute(
+        """
+        INSERT INTO users (telegram_id, full_name, username, stars, is_blocked, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (telegram_id) DO UPDATE SET
+            full_name = EXCLUDED.full_name,
+            username = EXCLUDED.username
+        """,
+        (telegram_id, full_name or "", username or "", 1, 0, now())
+    )
     conn.commit()
     conn.close()
 
@@ -151,7 +143,7 @@ def add_user(telegram_id, full_name="", username=""):
 def is_blocked(telegram_id):
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT is_blocked FROM users WHERE telegram_id = ?", (telegram_id,))
+    cur.execute("SELECT is_blocked FROM users WHERE telegram_id = %s", (telegram_id,))
     row = cur.fetchone()
     conn.close()
     return bool(row and row[0] == 1)
@@ -160,7 +152,7 @@ def is_blocked(telegram_id):
 def set_block_status(telegram_id, status):
     conn = db()
     cur = conn.cursor()
-    cur.execute("UPDATE users SET is_blocked = ? WHERE telegram_id = ?", (status, telegram_id))
+    cur.execute("UPDATE users SET is_blocked = %s WHERE telegram_id = %s", (status, telegram_id))
     conn.commit()
     conn.close()
 
@@ -168,7 +160,7 @@ def set_block_status(telegram_id, status):
 def get_stars(telegram_id):
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT stars FROM users WHERE telegram_id = ?", (telegram_id,))
+    cur.execute("SELECT stars FROM users WHERE telegram_id = %s", (telegram_id,))
     row = cur.fetchone()
     conn.close()
     return row[0] if row else 0
@@ -177,15 +169,15 @@ def get_stars(telegram_id):
 def change_stars(telegram_id, amount):
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT telegram_id FROM users WHERE telegram_id = ?", (telegram_id,))
-    exists = cur.fetchone()
-    if not exists:
-        cur.execute(
-            "INSERT INTO users (telegram_id, full_name, username, stars, is_blocked, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (telegram_id, "", "", amount, 0, now())
-        )
-    else:
-        cur.execute("UPDATE users SET stars = stars + ? WHERE telegram_id = ?", (amount, telegram_id))
+    cur.execute(
+        """
+        INSERT INTO users (telegram_id, full_name, username, stars, is_blocked, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (telegram_id) DO UPDATE SET
+            stars = users.stars + EXCLUDED.stars
+        """,
+        (telegram_id, "", "", amount, 0, now())
+    )
     conn.commit()
     conn.close()
 
@@ -194,7 +186,7 @@ def store_used_by_other_user(store_id, telegram_id):
     conn = db()
     cur = conn.cursor()
     cur.execute(
-        "SELECT telegram_id FROM stores WHERE store_id = ? AND telegram_id != ? LIMIT 1",
+        "SELECT telegram_id FROM stores WHERE store_id = %s AND telegram_id != %s LIMIT 1",
         (store_id, telegram_id)
     )
     row = cur.fetchone()
@@ -205,18 +197,15 @@ def store_used_by_other_user(store_id, telegram_id):
 def save_store(telegram_id, store_id, store_name):
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT id FROM stores WHERE telegram_id = ? AND store_id = ?", (telegram_id, store_id))
-    exists = cur.fetchone()
-    if exists:
-        cur.execute(
-            "UPDATE stores SET store_name = ? WHERE telegram_id = ? AND store_id = ?",
-            (store_name, telegram_id, store_id)
-        )
-    else:
-        cur.execute(
-            "INSERT INTO stores (telegram_id, store_id, store_name, created_at) VALUES (?, ?, ?, ?)",
-            (telegram_id, store_id, store_name, now())
-        )
+    cur.execute(
+        """
+        INSERT INTO stores (telegram_id, store_id, store_name, created_at)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (telegram_id, store_id) DO UPDATE SET
+            store_name = EXCLUDED.store_name
+        """,
+        (telegram_id, store_id, store_name, now())
+    )
     conn.commit()
     conn.close()
 
@@ -225,7 +214,7 @@ def get_user_stores(telegram_id):
     conn = db()
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, store_id, store_name, created_at FROM stores WHERE telegram_id = ? ORDER BY id DESC",
+        "SELECT id, store_id, store_name, created_at FROM stores WHERE telegram_id = %s ORDER BY id DESC",
         (telegram_id,)
     )
     rows = cur.fetchall()
@@ -237,9 +226,12 @@ def get_store_by_id(row_id, telegram_id=None):
     conn = db()
     cur = conn.cursor()
     if telegram_id is None:
-        cur.execute("SELECT id, telegram_id, store_id, store_name FROM stores WHERE id = ?", (row_id,))
+        cur.execute("SELECT id, telegram_id, store_id, store_name FROM stores WHERE id = %s", (row_id,))
     else:
-        cur.execute("SELECT id, telegram_id, store_id, store_name FROM stores WHERE id = ? AND telegram_id = ?", (row_id, telegram_id))
+        cur.execute(
+            "SELECT id, telegram_id, store_id, store_name FROM stores WHERE id = %s AND telegram_id = %s",
+            (row_id, telegram_id)
+        )
     row = cur.fetchone()
     conn.close()
     return row
@@ -248,7 +240,7 @@ def get_store_by_id(row_id, telegram_id=None):
 def delete_store(row_id, telegram_id):
     conn = db()
     cur = conn.cursor()
-    cur.execute("DELETE FROM stores WHERE id = ? AND telegram_id = ?", (row_id, telegram_id))
+    cur.execute("DELETE FROM stores WHERE id = %s AND telegram_id = %s", (row_id, telegram_id))
     conn.commit()
     conn.close()
 
@@ -257,7 +249,10 @@ def save_booking(telegram_id, store_id, store_name, invoice, date, status, resul
     conn = db()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO bookings (telegram_id, store_id, store_name, invoice, date, status, result, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        """
+        INSERT INTO bookings (telegram_id, store_id, store_name, invoice, date, status, result, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """,
         (telegram_id, store_id, store_name, invoice, date, status, result, now())
     )
     conn.commit()
@@ -268,7 +263,13 @@ def get_user_bookings(telegram_id):
     conn = db()
     cur = conn.cursor()
     cur.execute(
-        "SELECT store_name, store_id, invoice, date, status, result, created_at FROM bookings WHERE telegram_id = ? ORDER BY id DESC LIMIT 10",
+        """
+        SELECT store_name, store_id, invoice, date, status, result, created_at
+        FROM bookings
+        WHERE telegram_id = %s
+        ORDER BY id DESC
+        LIMIT 10
+        """,
         (telegram_id,)
     )
     rows = cur.fetchall()
@@ -294,7 +295,10 @@ def get_stats():
 def get_all_users(limit=20):
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT telegram_id, full_name, username, stars, is_blocked, created_at FROM users ORDER BY created_at DESC LIMIT ?", (limit,))
+    cur.execute(
+        "SELECT telegram_id, full_name, username, stars, is_blocked, created_at FROM users ORDER BY created_at DESC LIMIT %s",
+        (limit,)
+    )
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -304,7 +308,13 @@ def get_all_stores(limit=30):
     conn = db()
     cur = conn.cursor()
     cur.execute(
-        "SELECT s.store_id, s.store_name, s.telegram_id, u.full_name, u.username, s.created_at FROM stores s LEFT JOIN users u ON s.telegram_id = u.telegram_id ORDER BY s.id DESC LIMIT ?",
+        """
+        SELECT s.store_id, s.store_name, s.telegram_id, u.full_name, u.username, s.created_at
+        FROM stores s
+        LEFT JOIN users u ON s.telegram_id = u.telegram_id
+        ORDER BY s.id DESC
+        LIMIT %s
+        """,
         (limit,)
     )
     rows = cur.fetchall()
@@ -316,7 +326,13 @@ def get_all_bookings(limit=30):
     conn = db()
     cur = conn.cursor()
     cur.execute(
-        "SELECT b.telegram_id, u.full_name, b.store_name, b.store_id, b.invoice, b.date, b.status, b.result, b.created_at FROM bookings b LEFT JOIN users u ON b.telegram_id = u.telegram_id ORDER BY b.id DESC LIMIT ?",
+        """
+        SELECT b.telegram_id, u.full_name, b.store_name, b.store_id, b.invoice, b.date, b.status, b.result, b.created_at
+        FROM bookings b
+        LEFT JOIN users u ON b.telegram_id = u.telegram_id
+        ORDER BY b.id DESC
+        LIMIT %s
+        """,
         (limit,)
     )
     rows = cur.fetchall()
@@ -348,6 +364,25 @@ def uzum_headers():
     if UZUM_COOKIE:
         headers["Cookie"] = UZUM_COOKIE
     return headers
+
+
+async def get_http_session():
+    global http_session
+    if http_session is None or http_session.closed:
+        timeout = aiohttp.ClientTimeout(total=4, connect=2, sock_read=3)
+        connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300, keepalive_timeout=30)
+        http_session = aiohttp.ClientSession(
+            headers=uzum_headers(),
+            timeout=timeout,
+            connector=connector,
+        )
+    return http_session
+
+
+async def close_http_session():
+    global http_session
+    if http_session and not http_session.closed:
+        await http_session.close()
 
 
 async def read_response(response):
@@ -458,16 +493,17 @@ async def uzum_find_invoice_id(shop_id: str, invoice_text: str):
         return int(invoice_text)
     if invoice_text.isdigit() and invoice_text.startswith("11000") and len(invoice_text) >= 12:
         return int(invoice_text[5:])
+
     url = f"https://api-seller.uzum.uz/api/seller/shop/{shop_id}/invoice?page=0&size=20&invoiceNumber={invoice_text}"
-    async with aiohttp.ClientSession(headers=uzum_headers()) as session:
-        async with session.get(url) as response:
-            data = await read_response(response)
-            if response.status != 200:
-                raise Exception(f"Invoice qidirishda xato: {response.status}. Javob: {short_data(data)}")
-            record = find_invoice_record(data, invoice_text)
-            if not record:
-                raise Exception(f"Invoice topilmadi. Qidirilgan: {invoice_text}. Javob: {short_data(data)}")
-            return int(record["id"])
+    session = await get_http_session()
+    async with session.get(url) as response:
+        data = await read_response(response)
+        if response.status != 200:
+            raise Exception(f"Invoice qidirishda xato: {response.status}. Javob: {short_data(data)}")
+        record = find_invoice_record(data, invoice_text)
+        if not record:
+            raise Exception(f"Invoice topilmadi. Qidirilgan: {invoice_text}. Javob: {short_data(data)}")
+        return int(record["id"])
 
 
 async def uzum_get_slots(shop_id: str, invoice_id: int, date_text: str):
@@ -477,16 +513,20 @@ async def uzum_get_slots(shop_id: str, invoice_id: int, date_text: str):
         "poolSource": UZUM_POOL_SOURCE,
         "timeFrom": date_to_timestamp_ms(date_text)
     }
-    async with aiohttp.ClientSession(headers=uzum_headers()) as session:
-        async with session.post(url, json=payload) as response:
-            data = await read_response(response)
-            if response.status == 400:
-                return []
-            if response.status == 403:
-                raise Exception(f"Ruxsat yo'q: {short_data(data)}")
-            if response.status != 200:
-                return []
-            return find_timeslots(data)
+    session = await get_http_session()
+    async with session.post(url, json=payload) as response:
+        data = await read_response(response)
+        if response.status == 400:
+            return []
+        if response.status == 403:
+            raise Exception(f"Ruxsat yo'q: {short_data(data)}")
+        if response.status in (401, 419):
+            raise Exception(f"Sessiya/token eskirgan bo'lishi mumkin: {response.status}. Javob: {short_data(data)}")
+        if response.status == 429:
+            raise Exception(f"Juda ko'p so'rov yuborildi: {short_data(data)}")
+        if response.status != 200:
+            return []
+        return find_timeslots(data)
 
 
 async def uzum_set_slot(shop_id: str, invoice_id: int, time_from: int):
@@ -497,12 +537,24 @@ async def uzum_set_slot(shop_id: str, invoice_id: int, time_from: int):
         "poolSource": UZUM_POOL_SOURCE,
         "stockId": UZUM_STOCK_ID
     }
-    async with aiohttp.ClientSession(headers=uzum_headers()) as session:
-        async with session.post(url, json=payload) as response:
-            data = await read_response(response)
-            if response.status != 200:
-                raise Exception(f"Slot saqlashda xato: {response.status}. Javob: {short_data(data)}")
-            return data
+    session = await get_http_session()
+    async with session.post(url, json=payload) as response:
+        data = await read_response(response)
+        if response.status != 200:
+            raise Exception(f"Slot saqlashda xato: {response.status}. Javob: {short_data(data)}")
+        return data
+
+
+async def fast_book_slot(shop_id: str, invoice_id: int, time_from: int, attempts: int = 3):
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            return await uzum_set_slot(shop_id, invoice_id, time_from)
+        except Exception as e:
+            last_error = e
+            if attempt < attempts - 1:
+                await asyncio.sleep(0.12)
+    raise last_error
 
 
 # ================= MENUS =================
@@ -698,7 +750,7 @@ async def auto_search_slot(search_id: str):
                         continue
 
                     try:
-                        await uzum_set_slot(store_id, invoice_id, time_from)
+                        await fast_book_slot(store_id, invoice_id, time_from)
 
                         save_booking(telegram_id, store_id, store_name, invoice_text, wanted_date, "booked",
                                      f"invoice_id={invoice_id}, timeFrom={time_from}, search_id={search_id}")
@@ -1467,7 +1519,10 @@ async def admin_unblock_user_id(message: Message, state: FSMContext):
 async def main():
     init_db()
     print("Bot ishga tushdi...")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await close_http_session()
 
 
 if __name__ == "__main__":
