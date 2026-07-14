@@ -33,7 +33,7 @@ UZUM_COOKIE = os.getenv("UZUM_COOKIE")
 UZUM_POOL_SOURCE = os.getenv("UZUM_POOL_SOURCE", "FULLFILMENT")
 UZUM_STOCK_ID = int(os.getenv("UZUM_STOCK_ID", "34"))
 
-SEARCH_INTERVAL = int(os.getenv("SEARCH_INTERVAL", "3"))
+SEARCH_INTERVAL = int(os.getenv("SEARCH_INTERVAL", "1"))
 SEARCH_HOURS = int(os.getenv("SEARCH_HOURS", "4"))
 
 PAYMENT_CARD = os.getenv("PAYMENT_CARD", "0000 0000 0000 0000")
@@ -553,7 +553,7 @@ async def fast_book_slot(shop_id: str, invoice_id: int, time_from: int, attempts
         except Exception as e:
             last_error = e
             if attempt < attempts - 1:
-                await asyncio.sleep(0.12)
+                await asyncio.sleep(0.05)
     raise last_error
 
 
