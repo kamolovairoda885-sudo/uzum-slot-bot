@@ -33,8 +33,8 @@ UZUM_COOKIE = os.getenv("UZUM_COOKIE")
 UZUM_POOL_SOURCE = os.getenv("UZUM_POOL_SOURCE", "FULLFILMENT")
 UZUM_STOCK_ID = int(os.getenv("UZUM_STOCK_ID", "34"))
 
-SEARCH_INTERVAL = int(os.getenv("SEARCH_INTERVAL", "1"))
-SEARCH_HOURS = int(os.getenv("SEARCH_HOURS", "4"))
+SEARCH_INTERVAL = float(os.getenv("SEARCH_INTERVAL", "0.5"))
+SEARCH_HOURS = int(os.getenv("SEARCH_HOURS", "12"))
 
 PAYMENT_CARD = os.getenv("PAYMENT_CARD", "0000 0000 0000 0000")
 PAYMENT_OWNER = os.getenv("PAYMENT_OWNER", "Ism Familiya")
