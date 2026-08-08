@@ -5,7 +5,6 @@ import psycopg2
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-
 import aiohttp
 from dotenv import load_dotenv
 
@@ -514,8 +513,11 @@ async def uzum_get_slots(shop_id: str, invoice_id: int, date_text: str):
         "timeFrom": date_to_timestamp_ms(date_text)
     }
     session = await get_http_session()
+    start_time = time.perf_counter()
     async with session.post(url, json=payload) as response:
         data = await read_response(response)
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+print(f"[GET SLOT] status={response.status} time={elapsed_ms:.0f}ms shop={shop_id} invoice={invoice_id}")
         if response.status == 400:
             return []
         if response.status == 403:
@@ -538,8 +540,12 @@ async def uzum_set_slot(shop_id: str, invoice_id: int, time_from: int):
         "stockId": UZUM_STOCK_ID
     }
     session = await get_http_session()
+    start_time = time.perf_counter()
     async with session.post(url, json=payload) as response:
         data = await read_response(response)
+
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+print(f"[SET SLOT] status={response.status} time={elapsed_ms:.0f}ms shop={shop_id} invoice={invoice_id}")
         if response.status != 200:
             raise Exception(f"Slot saqlashda xato: {response.status}. Javob: {short_data(data)}")
         return data
