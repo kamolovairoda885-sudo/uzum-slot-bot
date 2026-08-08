@@ -549,7 +549,7 @@ async def uzum_set_slot(shop_id: str, invoice_id: int, time_from: int):
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         print(f"[SET SLOT] status={response.status} time={elapsed_ms:.0f}ms shop={shop_id} invoice={invoice_id}")
         if response.status != 200:
-            raise Exception(f"Slot saqlashda xato: {response.status}. Javob: {short_data(data)}")
+            raise Exception(f"Slot saqlashda xato: {response.status}. Javob: {short_data(data)}")=
         return data
 
 
@@ -758,7 +758,10 @@ async def auto_search_slot(search_id: str):
                         continue
 
                     try:
+                        book_start = time.perf_counter()
                         await fast_book_slot(store_id, invoice_id, time_from)
+                        book_delay_ms = (time.perf_counter() - book_start) * 1000
+                        print(f"[BOOK FLOW] total={book_delay_ms:.0f}ms invoice={invoice_id}")
 
                         save_booking(telegram_id, store_id, store_name, invoice_text, wanted_date, "booked",
                                      f"invoice_id={invoice_id}, timeFrom={time_from}, search_id={search_id}")
