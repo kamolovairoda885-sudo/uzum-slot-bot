@@ -549,7 +549,7 @@ async def uzum_set_slot(shop_id: str, invoice_id: int, time_from: int):
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         print(f"[SET SLOT] status={response.status} time={elapsed_ms:.0f}ms shop={shop_id} invoice={invoice_id}")
         if response.status != 200:
-            raise Exception(f"Slot saqlashda xato: {response.status}. Javob: {short_data(data)}")=
+            raise Exception(f"Slot saqlashda xato: {response.status}. Javob: {short_data(data)}")
         return data
 
 
