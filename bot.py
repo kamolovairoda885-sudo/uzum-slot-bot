@@ -525,7 +525,11 @@ async def uzum_get_slots(shop_id: str, invoice_id: int, date_text: str):
         if response.status == 403:
             raise Exception(f"Ruxsat yo'q: {short_data(data)}")
         if response.status in (401, 419):
-            raise Exception(f"Sessiya/token eskirgan bo'lishi mumkin: {response.status}. Javob: {short_data(data)}")
+            print(
+        f"[AUTH ERROR] status={response.status} "
+        f"shop={shop_id} invoice={invoice_id} "
+        f"response={short_data(data)}")
+            return []
         if response.status == 429:
             raise Exception(f"Juda ko'p so'rov yuborildi: {short_data(data)}")
         if response.status != 200:
