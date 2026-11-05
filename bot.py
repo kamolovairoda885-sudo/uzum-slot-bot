@@ -787,6 +787,11 @@ async def auto_search_slot(search_id: str):
                     except Exception:
                         continue
 
+        
+        except (asyncio.TimeoutError, aiohttp.ClientConnectionError) as e:
+            print(f"[TIMEOUT RETRY] invoice={invoice_id}: {e}")
+            await asyncio.sleep(3)
+            continue
         except Exception as e:
             item = active_searches.get(search_id)
             await refund_reserved_star(search_id, item)
