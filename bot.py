@@ -32,7 +32,7 @@ UZUM_COOKIE = os.getenv("UZUM_COOKIE")
 UZUM_POOL_SOURCE = os.getenv("UZUM_POOL_SOURCE", "FULLFILMENT")
 UZUM_STOCK_ID = int(os.getenv("UZUM_STOCK_ID", "34"))
 
-SEARCH_INTERVAL = float(os.getenv("SEARCH_INTERVAL", "0.5"))
+SEARCH_INTERVAL = float(os.getenv("SEARCH_INTERVAL", "1"))
 SEARCH_HOURS = int(os.getenv("SEARCH_HOURS", "12"))
 
 PAYMENT_CARD = os.getenv("PAYMENT_CARD", "0000 0000 0000 0000")
@@ -55,6 +55,8 @@ UZ_TZ = timezone(timedelta(hours=5))
 active_searches = {}
 pending_payments = {}
 http_session = None
+# Bir vaqtda Uzum API ga yuboriladigan so‘rovlarni cheklash.
+api_semaphore = asyncio.Semaphore(int(os.getenv("UZUM_MAX_CONCURRENT", "5")))
 
 STAR_PLANS = {
     "1": {"stars": 1, "price": 25000},
@@ -368,7 +370,7 @@ def uzum_headers():
 async def get_http_session():
     global http_session
     if http_session is None or http_session.closed:
-        timeout = aiohttp.ClientTimeout(total=4, connect=2, sock_read=3)
+        timeout = aiohttp.ClientTimeout(total=8, connect=4, sock_read=6)
         connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300, keepalive_timeout=30)
         http_session = aiohttp.ClientSession(
             headers=uzum_headers(),
@@ -515,26 +517,26 @@ async def uzum_get_slots(shop_id: str, invoice_id: int, date_text: str):
     session = await get_http_session()
     start_time = time.perf_counter()
     
-    async with session.post(url, json=payload) as response:
-        data = await read_response(response)
-        elapsed_ms = (time.perf_counter() - start_time) * 1000
-        print(f"[GET SLOT] status={response.status} time={elapsed_ms:.0f}ms shop={shop_id} invoice={invoice_id}")
+    async with api_semaphore:
+        async with session.post(url, json=payload) as response:
+            data = await read_response(response)
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            print(f"[GET SLOT] status={response.status} time={elapsed_ms:.0f}ms shop={shop_id} invoice={invoice_id}")
 
-        if response.status == 400:
-            return []
-        if response.status == 403:
-            raise Exception(f"Ruxsat yo'q: {short_data(data)}")
-        if response.status in (401, 419):
-            print(
-        f"[AUTH ERROR] status={response.status} "
-        f"shop={shop_id} invoice={invoice_id} "
-        f"response={short_data(data)}")
-            return []
-        if response.status == 429:
-            raise Exception(f"Juda ko'p so'rov yuborildi: {short_data(data)}")
-        if response.status != 200:
-            return []
-        return find_timeslots(data)
+            if response.status == 400:
+                print(f"[GET INVALID] invoice={invoice_id} response={short_data(data)}", flush=True)
+                return []
+            if response.status == 403:
+                raise Exception(f"Ruxsat yo'q: {short_data(data)}")
+            if response.status in (401, 419):
+                print(f"[AUTH ERROR] status={response.status} shop={shop_id} invoice={invoice_id} response={short_data(data)}", flush=True)
+                raise RuntimeError(f"Uzum authorization eskirgan: {response.status}")
+            if response.status == 429:
+                raise Exception(f"Juda ko'p so'rov yuborildi: {short_data(data)}")
+            if response.status != 200:
+                print(f"[GET ERROR] status={response.status} invoice={invoice_id} response={short_data(data)}", flush=True)
+                return []
+            return find_timeslots(data)
 
 
 async def uzum_set_slot(shop_id: str, invoice_id: int, time_from: int):
@@ -548,13 +550,14 @@ async def uzum_set_slot(shop_id: str, invoice_id: int, time_from: int):
     session = await get_http_session()
     start_time = time.perf_counter()
     
-    async with session.post(url, json=payload) as response:
-        data = await read_response(response)
-        elapsed_ms = (time.perf_counter() - start_time) * 1000
-        print(f"[SET SLOT] status={response.status} time={elapsed_ms:.0f}ms shop={shop_id} invoice={invoice_id}")
-        if response.status != 200:
-            raise Exception(f"Slot saqlashda xato: {response.status}. Javob: {short_data(data)}")
-        return data
+    async with api_semaphore:
+        async with session.post(url, json=payload) as response:
+            data = await read_response(response)
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            print(f"[SET SLOT] status={response.status} time={elapsed_ms:.0f}ms shop={shop_id} invoice={invoice_id}")
+            if response.status != 200:
+                raise Exception(f"Slot saqlashda xato: {response.status}. Javob: {short_data(data)}")
+            return data
 
 
 async def fast_book_slot(shop_id: str, invoice_id: int, time_from: int, attempts: int = 3):
@@ -707,7 +710,7 @@ class AdminState(StatesGroup):
 
 async def refund_reserved_star(search_id, item):
     if item and item.get("star_reserved"):
-        change_stars(item["telegram_id"], 1)
+        await asyncio.to_thread(change_stars, item["telegram_id"], 1)
         item["star_reserved"] = False
 
 
@@ -767,8 +770,8 @@ async def auto_search_slot(search_id: str):
                         book_delay_ms = (time.perf_counter() - book_start) * 1000
                         print(f"[BOOK FLOW] total={book_delay_ms:.0f}ms invoice={invoice_id}")
 
-                        save_booking(telegram_id, store_id, store_name, invoice_text, wanted_date, "booked",
-                                     f"invoice_id={invoice_id}, timeFrom={time_from}, search_id={search_id}")
+                        await asyncio.to_thread(save_booking, telegram_id, store_id, store_name, invoice_text, wanted_date, "booked",
+                                                f"invoice_id={invoice_id}, timeFrom={time_from}, search_id={search_id}")
 
                         active_searches.pop(search_id, None)
 
@@ -784,19 +787,24 @@ async def auto_search_slot(search_id: str):
                         )
                         return
 
-                    except Exception:
+                    except Exception as e:
+                        print(f"[BOOK FAIL] invoice={invoice_id} timeFrom={time_from} error={type(e).__name__}: {e}", flush=True)
                         continue
 
         
         except (asyncio.TimeoutError, aiohttp.ClientConnectionError) as e:
             print(f"[TIMEOUT RETRY] invoice={invoice_id}: {e}")
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
             continue
         except Exception as e:
+            if "Juda ko'p so'rov" in str(e):
+                print(f"[RATE LIMIT] invoice={invoice_id}: {e}", flush=True)
+                await asyncio.sleep(10)
+                continue
             item = active_searches.get(search_id)
             await refund_reserved_star(search_id, item)
 
-            save_booking(telegram_id, store_id, store_name, invoice_text, ", ".join(dates), "error", str(e))
+            await asyncio.to_thread(save_booking, telegram_id, store_id, store_name, invoice_text, ", ".join(dates), "error", str(e))
             active_searches.pop(search_id, None)
 
             await bot.send_message(
@@ -815,8 +823,8 @@ async def auto_search_slot(search_id: str):
     await refund_reserved_star(search_id, item)
     active_searches.pop(search_id, None)
 
-    save_booking(telegram_id, store_id, store_name, invoice_text, ", ".join(dates), "timeout",
-                 f"{SEARCH_HOURS} soat ichida slot topilmadi")
+    await asyncio.to_thread(save_booking, telegram_id, store_id, store_name, invoice_text, ", ".join(dates), "timeout",
+                            f"{SEARCH_HOURS} soat ichida slot topilmadi")
 
     await bot.send_message(
         telegram_id,
@@ -1123,7 +1131,7 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext):
     for invoice_text in invoices:
         try:
             invoice_id = await uzum_find_invoice_id(store_id, invoice_text)
-            change_stars(telegram_id, -1)
+            await asyncio.to_thread(change_stars, telegram_id, -1)
             search_id = uuid.uuid4().hex[:8]
             active_searches[search_id] = {
                 "telegram_id": telegram_id,
