@@ -727,6 +727,8 @@ async def auto_search_slot(search_id: str):
     dates = item["dates"]
 
     deadline = time.time() + SEARCH_HOURS * 60 * 60
+    auth_errors = 0
+    auth_notified = False
 
     await bot.send_message(
         telegram_id,
@@ -750,6 +752,8 @@ async def auto_search_slot(search_id: str):
 
                 wanted_date = normalize_date_text(date_text)
                 slots = await uzum_get_slots(store_id, invoice_id, date_text)
+                auth_errors = 0
+                auth_notified = False
 
                 matched_slots = [
                     slot for slot in slots
@@ -797,6 +801,32 @@ async def auto_search_slot(search_id: str):
             await asyncio.sleep(2)
             continue
         except Exception as e:
+            if "Uzum authorization eskirgan:" in str(e):
+                auth_errors += 1
+
+                print(
+                    f"[AUTH RETRY] shop={store_id} "
+                    f"invoice={invoice_id} "
+                    f"attempt={auth_errors}",
+                    flush=True
+                )
+
+                if auth_errors >= 3:
+                    if not auth_notified:
+                        await bot.send_message(
+                            telegram_id,
+                            f"⚠️ Uzum avtorizatsiyasi tekshirilmoqda.\n"
+                            f"📦 Invoice: {invoice_text}\n"
+                            f"401 xatosi takrorlandi.\n"
+                            f"Qidiruv to'xtatilmadi."
+                        )
+                        auth_notified = True
+
+                    await asyncio.sleep(30)
+                else:
+                    await asyncio.sleep(5)
+
+                continue
             if "Juda ko'p so'rov" in str(e):
                 print(f"[RATE LIMIT] invoice={invoice_id}: {e}", flush=True)
                 await asyncio.sleep(10)
