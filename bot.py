@@ -4,6 +4,7 @@ import re
 import psycopg2
 import time
 import uuid
+import random
 from datetime import datetime, timedelta, timezone
 import aiohttp
 from dotenv import load_dotenv
@@ -56,7 +57,30 @@ active_searches = {}
 pending_payments = {}
 http_session = None
 # Bir vaqtda Uzum API ga yuboriladigan so‘rovlarni cheklash.
-api_semaphore = asyncio.Semaphore(int(os.getenv("UZUM_MAX_CONCURRENT", "5")))
+api_semaphore = asyncio.Semaphore(max(1, int(os.getenv("UZUM_MAX_CONCURRENT", "5"))))
+# 15-20 invoice uchun umumiy API tezlik limiti (sekundiga).
+UZUM_RPS = max(0.2, float(os.getenv("UZUM_RPS", "5")))
+_api_rate_lock = asyncio.Lock()
+_api_next_request = 0.0
+
+async def throttle_uzum():
+    global _api_next_request
+    async with _api_rate_lock:
+        current = asyncio.get_running_loop().time()
+        delay = max(0.0, _api_next_request - current)
+        _api_next_request = max(current, _api_next_request) + 1.0 / UZUM_RPS
+    if delay:
+        await asyncio.sleep(delay)
+
+class UzumTemporaryError(Exception):
+    def __init__(self, status, retry_after=None):
+        super().__init__(f"Uzum vaqtinchalik xatosi: {status}")
+        self.status = status
+        self.retry_after = retry_after
+
+class UzumAuthError(Exception):
+    pass
+
 
 STAR_PLANS = {
     "1": {"stars": 1, "price": 25000},
@@ -517,6 +541,7 @@ async def uzum_get_slots(shop_id: str, invoice_id: int, date_text: str):
     session = await get_http_session()
     start_time = time.perf_counter()
     
+    await throttle_uzum()
     async with api_semaphore:
         async with session.post(url, json=payload) as response:
             data = await read_response(response)
@@ -530,9 +555,16 @@ async def uzum_get_slots(shop_id: str, invoice_id: int, date_text: str):
                 raise Exception(f"Ruxsat yo'q: {short_data(data)}")
             if response.status in (401, 419):
                 print(f"[AUTH ERROR] status={response.status} shop={shop_id} invoice={invoice_id} response={short_data(data)}", flush=True)
-                raise RuntimeError(f"Uzum authorization eskirgan: {response.status}")
+                raise UzumAuthError(f"Uzum authorization rad etildi: {response.status}")
             if response.status == 429:
-                raise Exception(f"Juda ko'p so'rov yuborildi: {short_data(data)}")
+                raw_retry = response.headers.get("Retry-After", "")
+                try:
+                    retry_after = min(300.0, max(1.0, float(raw_retry)))
+                except ValueError:
+                    retry_after = None
+                raise UzumTemporaryError(429, retry_after)
+            if response.status in (408, 425) or response.status >= 500:
+                raise UzumTemporaryError(response.status)
             if response.status != 200:
                 print(f"[GET ERROR] status={response.status} invoice={invoice_id} response={short_data(data)}", flush=True)
                 return []
@@ -550,13 +582,20 @@ async def uzum_set_slot(shop_id: str, invoice_id: int, time_from: int):
     session = await get_http_session()
     start_time = time.perf_counter()
     
+    await throttle_uzum()
     async with api_semaphore:
         async with session.post(url, json=payload) as response:
             data = await read_response(response)
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             print(f"[SET SLOT] status={response.status} time={elapsed_ms:.0f}ms shop={shop_id} invoice={invoice_id}")
+            if response.status in (401, 419):
+                raise UzumAuthError(f"Uzum authorization rad etildi: {response.status}")
+            if response.status == 429 or response.status in (408, 425) or response.status >= 500:
+                raise UzumTemporaryError(response.status)
             if response.status != 200:
                 raise Exception(f"Slot saqlashda xato: {response.status}. Javob: {short_data(data)}")
+            if isinstance(data, dict) and (data.get("success") is False or data.get("error") or data.get("errors")):
+                raise Exception(f"Slot saqlash tasdiqlanmadi: {short_data(data)}")
             return data
 
 
@@ -565,10 +604,12 @@ async def fast_book_slot(shop_id: str, invoice_id: int, time_from: int, attempts
     for attempt in range(attempts):
         try:
             return await uzum_set_slot(shop_id, invoice_id, time_from)
+        except UzumAuthError:
+            raise
         except Exception as e:
             last_error = e
             if attempt < attempts - 1:
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.25 * (attempt + 1))
     raise last_error
 
 
@@ -729,6 +770,7 @@ async def auto_search_slot(search_id: str):
     deadline = time.time() + SEARCH_HOURS * 60 * 60
     auth_errors = 0
     auth_notified = False
+    temporary_errors = 0
 
     await bot.send_message(
         telegram_id,
@@ -754,6 +796,7 @@ async def auto_search_slot(search_id: str):
                 slots = await uzum_get_slots(store_id, invoice_id, date_text)
                 auth_errors = 0
                 auth_notified = False
+                temporary_errors = 0
 
                 matched_slots = [
                     slot for slot in slots
@@ -791,67 +834,60 @@ async def auto_search_slot(search_id: str):
                         )
                         return
 
+                    except (UzumAuthError, UzumTemporaryError, asyncio.TimeoutError, aiohttp.ClientError):
+                        raise
                     except Exception as e:
                         print(f"[BOOK FAIL] invoice={invoice_id} timeFrom={time_from} error={type(e).__name__}: {e}", flush=True)
                         continue
 
         
-        except (asyncio.TimeoutError, aiohttp.ClientConnectionError) as e:
-            print(f"[TIMEOUT RETRY] invoice={invoice_id}: {e}")
-            await asyncio.sleep(2)
+        except UzumAuthError as e:
+            auth_errors += 1
+            print(f"[AUTH RETRY] shop={store_id} invoice={invoice_id} attempt={auth_errors}: {e}", flush=True)
+            if auth_errors >= 3 and not auth_notified:
+                auth_notified = True
+                try:
+                    await bot.send_message(telegram_id,
+                        f"⚠️ Uzum Seller 401/419 javob qaytarmoqda.\n📦 Invoice: {invoice_text}\n"
+                        "Qidiruv vaqtincha kutish rejimida, to'xtatilmagan. "
+                        "Seller ruxsatlari va token/cookie holatini tekshiring.")
+                except Exception as notify_error:
+                    print(f"[NOTIFY FAIL] {notify_error}", flush=True)
+            await asyncio.sleep(min(300, 15 * (2 ** min(auth_errors - 1, 4))) + random.uniform(0, 2))
+            continue
+        except UzumTemporaryError as e:
+            temporary_errors += 1
+            delay = e.retry_after if e.retry_after is not None else min(60, 3 * (2 ** min(temporary_errors - 1, 4)))
+            print(f"[UZUM RETRY] invoice={invoice_id} status={e.status} wait={delay}s", flush=True)
+            await asyncio.sleep(delay + random.uniform(0, 1))
+            continue
+        except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
+            temporary_errors += 1
+            delay = min(30, 2 * (2 ** min(temporary_errors - 1, 4)))
+            print(f"[NETWORK RETRY] invoice={invoice_id} attempt={temporary_errors} wait={delay}s: {type(e).__name__}: {e}", flush=True)
+            await asyncio.sleep(delay + random.uniform(0, 1))
             continue
         except Exception as e:
-            if "Uzum authorization eskirgan:" in str(e):
-                auth_errors += 1
-
-                print(
-                    f"[AUTH RETRY] shop={store_id} "
-                    f"invoice={invoice_id} "
-                    f"attempt={auth_errors}",
-                    flush=True
-                )
-
-                if auth_errors >= 3:
-                    if not auth_notified:
-                        await bot.send_message(
-                            telegram_id,
-                            f"⚠️ Uzum avtorizatsiyasi tekshirilmoqda.\n"
-                            f"📦 Invoice: {invoice_text}\n"
-                            f"401 xatosi takrorlandi.\n"
-                            f"Qidiruv to'xtatilmadi."
-                        )
-                        auth_notified = True
-
-                    await asyncio.sleep(30)
-                else:
-                    await asyncio.sleep(5)
-
-                continue
-            if "Juda ko'p so'rov" in str(e):
-                print(f"[RATE LIMIT] invoice={invoice_id}: {e}", flush=True)
-                await asyncio.sleep(10)
-                continue
+            print(f"[SEARCH ERROR] invoice={invoice_id}: {type(e).__name__}: {e}", flush=True)
             item = active_searches.get(search_id)
+            if item is None:
+                return
             await refund_reserved_star(search_id, item)
-
-            await asyncio.to_thread(save_booking, telegram_id, store_id, store_name, invoice_text, ", ".join(dates), "error", str(e))
             active_searches.pop(search_id, None)
-
-            await bot.send_message(
-                telegram_id,
-                f"❌ Qidiruvda xato chiqdi.\n\n"
-                f"📦 Invoice: {invoice_text}\n"
-                f"Xato: {e}\n\n"
-                f"⭐ Yulduz qaytarildi.",
-                reply_markup=main_menu()
-            )
+            await asyncio.to_thread(save_booking, telegram_id, store_id, store_name, invoice_text, ", ".join(dates), "error", str(e))
+            try:
+                await bot.send_message(telegram_id,
+                    f"❌ Qidiruvda xato chiqdi.\n\n📦 Invoice: {invoice_text}\nXato: {e}\n\n⭐ Yulduz qaytarildi.",
+                    reply_markup=main_menu())
+            except Exception as notify_error:
+                print(f"[NOTIFY FAIL] {notify_error}", flush=True)
             return
 
         await asyncio.sleep(SEARCH_INTERVAL)
 
     item = active_searches.get(search_id)
-    await refund_reserved_star(search_id, item)
     active_searches.pop(search_id, None)
+    await refund_reserved_star(search_id, item)
 
     await asyncio.to_thread(save_booking, telegram_id, store_id, store_name, invoice_text, ", ".join(dates), "timeout",
                             f"{SEARCH_HOURS} soat ichida slot topilmadi")
@@ -880,7 +916,7 @@ START_TEXT = (
     "✅ Slot topilsa avtomatik bron qilish\n\n"
     "🎬 Botdan foydalanish qo'llanmasi: https://youtu.be/5G54WLsr4rY\n"
     "📢 Kanal: https://t.me/uzumtimeslot\n\n"
-    "⚠️ Bot javob bermasa /start ni bosing.""📦 Uzum Time Slot Bot\n\n"
+    "⚠️ Bot javob bermasa /start ni bosing."
 )
 
 
@@ -1158,7 +1194,11 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext):
         return
     started = 0
     errors = []
-    for invoice_text in invoices:
+    for invoice_text in dict.fromkeys(invoices):
+        if any(x["telegram_id"] == telegram_id and x["store_id"] == store_id
+               and x["invoice_text"] == invoice_text for x in active_searches.values()):
+            errors.append(f"{invoice_text}: qidiruv allaqachon faol")
+            continue
         try:
             invoice_id = await uzum_find_invoice_id(store_id, invoice_text)
             await asyncio.to_thread(change_stars, telegram_id, -1)
@@ -1231,8 +1271,8 @@ async def stop_one_search(callback: CallbackQuery):
     if item["telegram_id"] != callback.from_user.id and not admin_check(callback.from_user.id):
         await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
-    await refund_reserved_star(search_id, item)
     active_searches.pop(search_id, None)
+    await refund_reserved_star(search_id, item)
     await callback.message.answer("🛑 Qidiruv to'xtatildi.\n\n⭐ Yulduz qaytarildi.", reply_markup=main_menu())
     await callback.answer()
 
@@ -1575,8 +1615,8 @@ async def admin_unblock_user_id(message: Message, state: FSMContext):
 # ================= RUN =================
 
 async def main():
-    init_db()
-    print("Bot ishga tushdi...")
+    await asyncio.to_thread(init_db)
+    print("Bot ishga tushdi...", flush=True)
     try:
         await dp.start_polling(bot)
     finally:
